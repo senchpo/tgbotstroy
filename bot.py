@@ -434,6 +434,14 @@ def handle_message(message):
                 f"🏷️ {category}\n"
             )
 
+        elif status == "duplicate":
+            print(f"⛔ Дубль: {name} | {phone}")
+            report_lines.append(
+                f"━━━━━━━━━━━━━━━\n"
+                f"⛔ Дубль — уже есть в Битрикс\n"
+                f"👤 {name} | 📞 {phone}"
+            )
+
         elif status == "no_phone":
             print(f"⚠️ Пропущен (нет телефона): {name}")
             report_lines.append(
@@ -449,12 +457,15 @@ def handle_message(message):
                 f"❌ Ошибка создания лида\n"
                 f"👤 {name} | 📞 {phone}"
             )
-                    header      = f"✅ Создано лидов: {success_count}\n\n"
+
+    if report_lines:
+        header      = f"✅ Создано лидов: {success_count}\n\n"
         full_report = header + "\n\n".join(report_lines)
         try:
             bot.send_message(message.chat.id, full_report)
         except Exception as e:
             print(f"❌ Ошибка отправки сообщения: {e}")
+
 
 # ============================================
 # ЗАПУСК
@@ -473,3 +484,5 @@ bot.polling(
     timeout=30,
     allowed_updates=["message"]
 )
+
+       
