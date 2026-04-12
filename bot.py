@@ -523,16 +523,31 @@ def handle_message(message):
 # ЗАПУСК
 # ============================================
 
-print("=" * 50)
-print("✅ Бот запущен!")
-print("=" * 50)
+f __name__ == "__main__":
+    print("=" * 50)
+    print("✅ Бот запущен!")
+    print("=" * 50)
 
-bot.remove_webhook()
-time.sleep(3)
+    # Снимаем вебхук и ждём
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Вебхук удалён")
+    except Exception as e:
+        print(f"⚠️ Ошибка удаления вебхука: {e}")
 
-bot.polling(
-    none_stop=True,
-    interval=1,
-    timeout=30,
-    allowed_updates=["message"]
-)
+    time.sleep(5)
+
+    # Запускаем polling с автоперезапуском
+    while True:
+        try:
+            print("🔄 Запускаем polling...")
+            bot.polling(
+                none_stop=True,
+                interval=2,
+                timeout=30,
+                allowed_updates=["message"]
+            )
+        except Exception as e:
+            print(f"❌ Polling упал: {e}")
+            print("🔄 Перезапуск через 10 секунд...")
+            time.sleep(10)
