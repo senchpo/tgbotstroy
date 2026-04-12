@@ -2,6 +2,7 @@ import telebot
 import requests
 import time
 import os
+import threading
 
 # ============================================
 # НАСТРОЙКИ
@@ -93,36 +94,38 @@ KEYWORDS = [
 ]
 
 # ============================================
+# ГЛОБАЛЬНЫЙ ЗАМОК ОТ ДУБЛЕЙ
+# ← Защита от двойной обработки одного сообщения
+# ============================================
+
+processed_messages = set()
+processing_phones  = set()        # телефоны в процессе создания прямо сейчас
+lock               = threading.Lock()
+
+# ============================================
 # ПРОВЕРКА ДУБЛЕЙ В БИТРИКС24
-# ← ВСТАВИТЬ ПОСЛЕ КЛЮЧЕВЫХ СЛОВ
 # ============================================
 
 def check_duplicate_in_bitrix(phone):
-    """
-    Проверяем — есть ли уже лид или контакт
-    с таким номером телефона в Битрикс24
-    """
     try:
-        # Нормализуем телефон — оставляем только цифры
         phone_clean = ''.join(filter(str.isdigit, phone))
         if len(phone_clean) < 10:
             return False
 
-        print(f"🔍 Проверяем дубль для телефона: {phone_clean}")
+        print(f"🔍 Проверяем дубль для: {phone_clean}")
 
         # Проверяем в лидах
         lead_resp = requests.post(
             BITRIX_URL + "crm.lead.list.json",
             json={
                 "filter": {"PHONE": phone_clean},
-                "select": ["ID", "TITLE", "DATE_CREATE"]
+                "select": ["ID", "TITLE"]
             },
             timeout=10
         )
         lead_result = lead_resp.json().get('result', [])
-
         if lead_result:
-            print(f"⛔ Дубль найден в ЛИДАХ: ID={lead_result[0]['ID']} | {lead_result[0].get('TITLE','')}")
+            print(f"⛔ Дубль в ЛИДАХ: ID={lead_result[0]['ID']}")
             return True
 
         # Проверяем в контактах
@@ -130,22 +133,34 @@ def check_duplicate_in_bitrix(phone):
             BITRIX_URL + "crm.contact.list.json",
             json={
                 "filter": {"PHONE": phone_clean},
-                "select": ["ID", "NAME", "DATE_CREATE"]
+                "select": ["ID", "NAME"]
             },
             timeout=10
         )
         contact_result = contact_resp.json().get('result', [])
-
         if contact_result:
-            print(f"⛔ Дубль найден в КОНТАКТАХ: ID={contact_result[0]['ID']} | {contact_result[0].get('NAME','')}")
+            print(f"⛔ Дубль в КОНТАКТАХ: ID={contact_result[0]['ID']}")
             return True
 
-        print(f"✅ Дублей нет — создаём лид")
+        # Проверяем в сделках
+        deal_resp = requests.post(
+            BITRIX_URL + "crm.deal.list.json",
+            json={
+                "filter": {"PHONE": phone_clean},
+                "select": ["ID", "TITLE"]
+            },
+            timeout=10
+        )
+        deal_result = deal_resp.json().get('result', [])
+        if deal_result:
+            print(f"⛔ Дубль в СДЕЛКАХ: ID={deal_result[0]['ID']}")
+            return True
+
+        print(f"✅ Дублей нет")
         return False
 
     except Exception as e:
         print(f"❌ Ошибка проверки дублей: {e}")
-        # При ошибке — НЕ блокируем, пропускаем проверку
         return False
 
 # ============================================
@@ -288,118 +303,124 @@ def send_to_bitrix(data, source_name, chat_title):
             print(f"⚠️ Нет телефона у {name}")
             return None, "no_phone", category
 
-        # ШАГ 2: ← ПРОВЕРКА ДУБЛЕЙ ЗДЕСЬ
-        if check_duplicate_in_bitrix(phone):
-            print(f"⛔ Пропускаем дубль: {name} | {phone}")
-            return None, "duplicate", category
+        phone_clean = ''.join(filter(str.isdigit, phone))
 
-        # ШАГ 3: Получаем тип сделки
-        type_id = get_type_id(category)
+        # ШАГ 2: Блокировка — защита от параллельного создания
+        with lock:
+            if phone_clean in processing_phones:
+                print(f"⛔ Телефон {phone_clean} уже создаётся прямо сейчас!")
+                return None, "duplicate", category
+            processing_phones.add(phone_clean)
 
-        comments = (
-            f"📢 Источник: {source_name}\n"
-            f"💬 Чат: {chat_title}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📐 Объём: {volume}\n"
-            f"📅 Срок: {deadline}\n"
-            f"🏷️ Тип ремонта: {category}\n"
-            f"💬 Комментарий: {comment}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📩 Исходное сообщение:\n{raw_text[:800]}"
-        )
+        try:
+            # ШАГ 3: Проверка дублей в Битрикс
+            if check_duplicate_in_bitrix(phone):
+                print(f"⛔ Пропускаем дубль: {name} | {phone}")
+                return None, "duplicate", category
 
-        title = f"Ремонт | {name} | {address[:50]}"
+            # ШАГ 4: Получаем тип сделки
+            type_id = get_type_id(category)
 
-        # ШАГ 4: Создаём контакт
-        contact_fields = {
-            "NAME":               name,
-            "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
-            "ADDRESS":            address,
-            "SOURCE_ID":          "UC_CRM_SOURCE",
-            "SOURCE_DESCRIPTION": source_name,
-            "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
-        }
+            comments = (
+                f"📢 Источник: {source_name}\n"
+                f"💬 Чат: {chat_title}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📐 Объём: {volume}\n"
+                f"📅 Срок: {deadline}\n"
+                f"🏷️ Тип ремонта: {category}\n"
+                f"💬 Комментарий: {comment}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📩 Исходное сообщение:\n{raw_text[:800]}"
+            )
 
-        contact_resp = requests.post(
-            BITRIX_URL + "crm.contact.add.json",
-            json={"fields": contact_fields},
-            timeout=10
-        )
-        contact_id = contact_resp.json().get('result')
-        print(f"Контакт создан ID: {contact_id}")
+            title = f"Ремонт | {name} | {address[:50]}"
 
-        # ШАГ 5: Создаём лид
-        lead_fields = {
-            "TITLE":              title,
-            "NAME":               name,
-            "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
-            "ADDRESS":            address,
-            "COMMENTS":           comments,
-            "SOURCE_ID":          "UC_CRM_SOURCE",
-            "SOURCE_DESCRIPTION": source_name,
-        }
+            # ШАГ 5: Создаём контакт БЕЗ ответственного
+            contact_fields = {
+                "NAME":               name,
+                "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
+                "ADDRESS":            address,
+                "SOURCE_ID":          "UC_CRM_SOURCE",
+                "SOURCE_DESCRIPTION": source_name,
+                "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
+                "ASSIGNED_BY_ID":     0,   # ← БЕЗ ответственного
+            }
 
-        if contact_id:
-            lead_fields["CONTACT_ID"] = contact_id
+            contact_resp = requests.post(
+                BITRIX_URL + "crm.contact.add.json",
+                json={"fields": contact_fields},
+                timeout=10
+            )
+            contact_id = contact_resp.json().get('result')
+            print(f"Контакт создан ID: {contact_id}")
 
-        lead_resp   = requests.post(
-            BITRIX_URL + "crm.lead.add.json",
-            json={"fields": lead_fields},
-            timeout=10
-        )
-        lead_result = lead_resp.json()
-        lead_id     = lead_result.get('result')
-        print(f"Лид создан ID: {lead_id}")
+            # ШАГ 6: Создаём лид БЕЗ ответственного
+            lead_fields = {
+                "TITLE":              title,
+                "NAME":               name,
+                "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
+                "ADDRESS":            address,
+                "COMMENTS":           comments,
+                "SOURCE_ID":          "UC_CRM_SOURCE",
+                "SOURCE_DESCRIPTION": source_name,
+                "ASSIGNED_BY_ID":     0,   # ← БЕЗ ответственного
+            }
 
-        # ШАГ 6: Создаём сделку
-        deal_fields = {
-            "TITLE":                title,
-            "COMMENTS":             comments,
-            "SOURCE_ID":            "UC_CRM_SOURCE",
-            "SOURCE_DESCRIPTION":   source_name,
-            "UF_CRM_1775766366237": address,
-        }
+            if contact_id:
+                lead_fields["CONTACT_ID"] = contact_id
 
-        if type_id:
-            deal_fields["TYPE_ID"] = type_id
+            lead_resp   = requests.post(
+                BITRIX_URL + "crm.lead.add.json",
+                json={"fields": lead_fields},
+                timeout=10
+            )
+            lead_id = lead_resp.json().get('result')
+            print(f"Лид создан ID: {lead_id}")
 
-        if contact_id:
-            deal_fields["CONTACT_IDS"] = [contact_id]
+            # ШАГ 7: Создаём сделку БЕЗ ответственного
+            deal_fields = {
+                "TITLE":                title,
+                "COMMENTS":             comments,
+                "SOURCE_ID":            "UC_CRM_SOURCE",
+                "SOURCE_DESCRIPTION":   source_name,
+                "UF_CRM_1775766366237": address,
+                "ASSIGNED_BY_ID":       0,   # ← БЕЗ ответственного
+            }
 
-        if lead_id:
-            deal_fields["LEAD_ID"] = lead_id
+            if type_id:
+                deal_fields["TYPE_ID"] = type_id
+            if contact_id:
+                deal_fields["CONTACT_IDS"] = [contact_id]
+            if lead_id:
+                deal_fields["LEAD_ID"] = lead_id
 
-        deal_resp   = requests.post(
-            BITRIX_URL + "crm.deal.add.json",
-            json={"fields": deal_fields},
-            timeout=10
-        )
-        deal_result = deal_resp.json()
-        deal_id     = deal_result.get('result')
-        print(f"Сделка создана ID: {deal_id}")
+            deal_resp = requests.post(
+                BITRIX_URL + "crm.deal.add.json",
+                json={"fields": deal_fields},
+                timeout=10
+            )
+            deal_id = deal_resp.json().get('result')
+            print(f"Сделка создана ID: {deal_id}")
 
-        if lead_id or deal_id:
-            return lead_id or deal_id, "ok", category
+            if lead_id or deal_id:
+                return lead_id or deal_id, "ok", category
 
-        return None, "bitrix_error", category
+            return None, "bitrix_error", category
+
+        finally:
+            # Снимаем блокировку телефона
+            with lock:
+                processing_phones.discard(phone_clean)
 
     except Exception as e:
         print(f"❌ Битрикс ошибка: {e}")
         return None, "error", category
 
 # ============================================
-# ИНИЦИАЛИЗАЦИЯ
+# ИНИЦИАЛИЗАЦИЯ БОТА
 # ============================================
 
-bot = telebot.TeleBot(TOKEN)
-bot.remove_webhook()
-time.sleep(1)
-
-# ============================================
-# ЗАЩИТА ОТ ДУБЛЕЙ TELEGRAM
-# ============================================
-
-processed_messages = set()
+bot = telebot.TeleBot(TOKEN, threaded=False)  # ← threaded=False убирает дубли!
 
 # ============================================
 # КОМАНДЫ
@@ -427,14 +448,15 @@ def cmd_test(message):
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
 
-    # Защита от дублей Telegram
-    msg_id = message.message_id
-    if msg_id in processed_messages:
-        print(f"⚠️ Сообщение {msg_id} уже обработано — пропускаем")
-        return
-    processed_messages.add(msg_id)
-    if len(processed_messages) > 1000:
-        processed_messages.clear()
+    # Защита от дублей по ID сообщения
+    msg_key = f"{message.chat.id}_{message.message_id}"
+    with lock:
+        if msg_key in processed_messages:
+            print(f"⚠️ Сообщение {msg_key} уже обработано — пропускаем")
+            return
+        processed_messages.add(msg_key)
+        if len(processed_messages) > 1000:
+            processed_messages.clear()
 
     text = message.text
     if not text or text.startswith('/') or len(text) < 10:
@@ -485,7 +507,6 @@ def handle_message(message):
                 f"📅 {deadline}\n"
                 f"🏷️ {category}\n"
             )
-
         elif status == "duplicate":
             print(f"⛔ Дубль: {name} | {phone}")
             report_lines.append(
@@ -493,7 +514,6 @@ def handle_message(message):
                 f"⛔ Дубль — уже есть в Битрикс\n"
                 f"👤 {name} | 📞 {phone}"
             )
-
         elif status == "no_phone":
             print(f"⚠️ Пропущен (нет телефона): {name}")
             report_lines.append(
@@ -501,7 +521,6 @@ def handle_message(message):
                 f"⚠️ Пропущен (нет телефона)\n"
                 f"👤 {name}"
             )
-
         else:
             print(f"❌ Ошибка для: {name}")
             report_lines.append(
@@ -528,16 +547,14 @@ if __name__ == "__main__":
     print("✅ Бот запущен!")
     print("=" * 50)
 
-    # Снимаем вебхук и ждём
     try:
         bot.delete_webhook(drop_pending_updates=True)
         print("✅ Вебхук удалён")
     except Exception as e:
-        print(f"⚠️ Ошибка удаления вебхука: {e}")
+        print(f"⚠️ Ошибка: {e}")
 
     time.sleep(5)
 
-    # Запускаем polling с автоперезапуском
     while True:
         try:
             print("🔄 Запускаем polling...")
