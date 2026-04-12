@@ -4,7 +4,7 @@ import time
 import os
 
 # ============================================
-# НАСТРОЙКИ — берём из переменных окружения
+# НАСТРОЙКИ
 # ============================================
 
 TOKEN        = os.environ.get("TOKEN", "")
@@ -12,7 +12,7 @@ BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 # ============================================
-# ИСТОЧНИКИ ЧАТОВ → БИТРИКС24
+# ИСТОЧНИКИ ЧАТОВ
 # ============================================
 
 CHAT_SOURCE_MAP = {
@@ -37,7 +37,7 @@ def get_source_from_chat(chat_title):
     return f'Telegram: {chat_title}'
 
 # ============================================
-# ТИП СДЕЛКИ → STATUS_ID ИЗ БИТРИКС24
+# ТИП СДЕЛКИ
 # ============================================
 
 REPAIR_TYPE_MAP = {
@@ -93,6 +93,62 @@ KEYWORDS = [
 ]
 
 # ============================================
+# ПРОВЕРКА ДУБЛЕЙ В БИТРИКС24
+# ← ВСТАВИТЬ ПОСЛЕ КЛЮЧЕВЫХ СЛОВ
+# ============================================
+
+def check_duplicate_in_bitrix(phone):
+    """
+    Проверяем — есть ли уже лид или контакт
+    с таким номером телефона в Битрикс24
+    """
+    try:
+        # Нормализуем телефон — оставляем только цифры
+        phone_clean = ''.join(filter(str.isdigit, phone))
+        if len(phone_clean) < 10:
+            return False
+
+        print(f"🔍 Проверяем дубль для телефона: {phone_clean}")
+
+        # Проверяем в лидах
+        lead_resp = requests.post(
+            BITRIX_URL + "crm.lead.list.json",
+            json={
+                "filter": {"PHONE": phone_clean},
+                "select": ["ID", "TITLE", "DATE_CREATE"]
+            },
+            timeout=10
+        )
+        lead_result = lead_resp.json().get('result', [])
+
+        if lead_result:
+            print(f"⛔ Дубль найден в ЛИДАХ: ID={lead_result[0]['ID']} | {lead_result[0].get('TITLE','')}")
+            return True
+
+        # Проверяем в контактах
+        contact_resp = requests.post(
+            BITRIX_URL + "crm.contact.list.json",
+            json={
+                "filter": {"PHONE": phone_clean},
+                "select": ["ID", "NAME", "DATE_CREATE"]
+            },
+            timeout=10
+        )
+        contact_result = contact_resp.json().get('result', [])
+
+        if contact_result:
+            print(f"⛔ Дубль найден в КОНТАКТАХ: ID={contact_result[0]['ID']} | {contact_result[0].get('NAME','')}")
+            return True
+
+        print(f"✅ Дублей нет — создаём лид")
+        return False
+
+    except Exception as e:
+        print(f"❌ Ошибка проверки дублей: {e}")
+        # При ошибке — НЕ блокируем, пропускаем проверку
+        return False
+
+# ============================================
 # AI ПАРСИНГ ЧЕРЕЗ GROQ
 # ============================================
 
@@ -133,7 +189,7 @@ def parse_lead_ai(text):
 - КОММЕНТАРИЙ: любые важные детали
 - Если данных нет — пиши ровно: Не указано
 
-КАТЕГОРИЯ — выбери ОДНУ точную строку из списка ниже (скопируй точно как написано):
+КАТЕГОРИЯ — выбери ОДНУ точную строку из списка ниже:
 {categories_list}
 
 Правила выбора КАТЕГОРИИ:
@@ -149,7 +205,6 @@ def parse_lead_ai(text):
 - офис / коммерческая → офис
 - капитальный / евро / под ключ / черновая / чистовая → Капитальный
 - косметический / частичный / освежить → Косметический
-- если тип не понятен — выбери ближайшую по смыслу
 
 Текст заявки:
 {text}"""
@@ -180,33 +235,24 @@ def parse_lead_ai(text):
             line = line.strip()
             if not line:
                 continue
-
             if line.startswith('ЛИД'):
                 if current_lead and current_lead.get('phone') and current_lead['phone'] != 'Не указано':
                     leads.append(current_lead)
                 current_lead = {'raw_text': text}
-
             elif line.startswith('ИМЯ:'):
                 current_lead['name'] = line.replace('ИМЯ:', '').strip()
-
             elif line.startswith('ТЕЛЕФОН:'):
                 current_lead['phone'] = line.replace('ТЕЛЕФОН:', '').strip()
-
             elif line.startswith('АДРЕС:'):
                 current_lead['address'] = line.replace('АДРЕС:', '').strip()
-
             elif line.startswith('ОБЪЁМ:'):
                 current_lead['work_volume'] = line.replace('ОБЪЁМ:', '').strip()
-
             elif line.startswith('СРОК:'):
                 current_lead['deadline'] = line.replace('СРОК:', '').strip()
-
             elif line.startswith('КАТЕГОРИЯ:'):
                 current_lead['category'] = line.replace('КАТЕГОРИЯ:', '').strip()
-
             elif line.startswith('КОММЕНТАРИЙ:'):
                 current_lead['comment'] = line.replace('КОММЕНТАРИЙ:', '').strip()
-
             elif line == '---':
                 if current_lead and current_lead.get('phone') and current_lead['phone'] != 'Не указано':
                     leads.append(current_lead)
@@ -237,10 +283,17 @@ def send_to_bitrix(data, source_name, chat_title):
         category = data.get('category', '').strip()
         raw_text = data.get('raw_text', '')
 
+        # ШАГ 1: Проверка телефона
         if not phone or phone == 'Не указано':
             print(f"⚠️ Нет телефона у {name}")
             return None, "no_phone", category
 
+        # ШАГ 2: ← ПРОВЕРКА ДУБЛЕЙ ЗДЕСЬ
+        if check_duplicate_in_bitrix(phone):
+            print(f"⛔ Пропускаем дубль: {name} | {phone}")
+            return None, "duplicate", category
+
+        # ШАГ 3: Получаем тип сделки
         type_id = get_type_id(category)
 
         comments = (
@@ -257,7 +310,7 @@ def send_to_bitrix(data, source_name, chat_title):
 
         title = f"Ремонт | {name} | {address[:50]}"
 
-        # ШАГ 1: Создаём контакт
+        # ШАГ 4: Создаём контакт
         contact_fields = {
             "NAME":               name,
             "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
@@ -275,7 +328,7 @@ def send_to_bitrix(data, source_name, chat_title):
         contact_id = contact_resp.json().get('result')
         print(f"Контакт создан ID: {contact_id}")
 
-        # ШАГ 2: Создаём лид
+        # ШАГ 5: Создаём лид
         lead_fields = {
             "TITLE":              title,
             "NAME":               name,
@@ -296,9 +349,9 @@ def send_to_bitrix(data, source_name, chat_title):
         )
         lead_result = lead_resp.json()
         lead_id     = lead_result.get('result')
-        print(f"Лид создан ID: {lead_id} | Ответ: {lead_result}")
+        print(f"Лид создан ID: {lead_id}")
 
-        # ШАГ 3: Создаём сделку
+        # ШАГ 6: Создаём сделку
         deal_fields = {
             "TITLE":                title,
             "COMMENTS":             comments,
@@ -309,7 +362,6 @@ def send_to_bitrix(data, source_name, chat_title):
 
         if type_id:
             deal_fields["TYPE_ID"] = type_id
-            print(f"✅ TYPE_ID установлен: {type_id} ({category})")
 
         if contact_id:
             deal_fields["CONTACT_IDS"] = [contact_id]
@@ -324,7 +376,7 @@ def send_to_bitrix(data, source_name, chat_title):
         )
         deal_result = deal_resp.json()
         deal_id     = deal_result.get('result')
-        print(f"Сделка создана ID: {deal_id} | Ответ: {deal_result}")
+        print(f"Сделка создана ID: {deal_id}")
 
         if lead_id or deal_id:
             return lead_id or deal_id, "ok", category
@@ -344,7 +396,7 @@ bot.remove_webhook()
 time.sleep(1)
 
 # ============================================
-# ЗАЩИТА ОТ ДУБЛЕЙ
+# ЗАЩИТА ОТ ДУБЛЕЙ TELEGRAM
 # ============================================
 
 processed_messages = set()
@@ -375,7 +427,7 @@ def cmd_test(message):
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
 
-    # Защита от дублей
+    # Защита от дублей Telegram
     msg_id = message.message_id
     if msg_id in processed_messages:
         print(f"⚠️ Сообщение {msg_id} уже обработано — пропускаем")
@@ -484,5 +536,3 @@ bot.polling(
     timeout=30,
     allowed_updates=["message"]
 )
-
-       
