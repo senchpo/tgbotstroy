@@ -406,15 +406,59 @@ def handle_message(message):
         print("⚠️ Лиды не найдены")
         return
 
+    # Счётчики для итогового сообщения
+    success_count = 0
+    report_lines  = []
+
     for lead in leads:
         lead_id, status, category = send_to_bitrix(lead, source_name, chat_title)
 
+        name     = lead.get('name', '—')
+        phone    = lead.get('phone', '—')
+        address  = lead.get('address', 'Не указано')
+        volume   = lead.get('work_volume', 'Не указано')
+        deadline = lead.get('deadline', 'Не указано')
+
         if status == "ok":
-            print(f"✅ Готово! ID:{lead_id} | {lead.get('name')} | {lead.get('phone')} | {category}")
+            success_count += 1
+            print(f"✅ Готово! ID:{lead_id} | {name} | {phone} | {category}")
+
+            report_lines.append(
+                f"━━━━━━━━━━━━━━━\n"
+                f"🆔 Лид #{lead_id}\n"
+                f"👤 {name}\n"
+                f"📞 {phone}\n"
+                f"📍 {address}\n"
+                f"📐 {volume}\n"
+                f"📅 {deadline}\n"
+                f"🏷️ {category}\n"
+            )
+
         elif status == "no_phone":
-            print(f"⚠️ Пропущен (нет телефона): {lead.get('name', '—')}")
+            print(f"⚠️ Пропущен (нет телефона): {name}")
+            report_lines.append(
+                f"━━━━━━━━━━━━━━━\n"
+                f"⚠️ Пропущен (нет телефона)\n"
+                f"👤 {name}"
+            )
+
         else:
-            print(f"❌ Ошибка для: {lead.get('name', '—')}")
+            print(f"❌ Ошибка для: {name}")
+            report_lines.append(
+                f"━━━━━━━━━━━━━━━\n"
+                f"❌ Ошибка создания лида\n"
+                f"👤 {name} | 📞 {phone}"
+            )
+
+    # ✅ Отправляем итоговое сообщение в чат
+    if report_lines:
+        header = f"✅ Создано лидов: {success_count}\n\n"
+        full_report = header + "\n\n".join(report_lines)
+        
+        try:
+            bot.send_message(message.chat.id, full_report)
+        except Exception as e:
+            print(f"❌ Ошибка отправки сообщения: {e}")
 
 # ============================================
 # ЗАПУСК
