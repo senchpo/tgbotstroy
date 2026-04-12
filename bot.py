@@ -468,4 +468,13 @@ print("=" * 50)
 print("✅ Бот запущен!")
 print("=" * 50)
 
-bot.polling(none_stop=True, interval=1)
+# Новый код — сбрасываем всё перед стартом:
+bot.remove_webhook()
+time.sleep(3)
+
+bot.polling(
+    none_stop=True,
+    interval=1,
+    timeout=30,
+    allowed_updates=["message"]
+)
