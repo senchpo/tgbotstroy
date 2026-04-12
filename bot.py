@@ -382,8 +382,19 @@ def cmd_test(message):
 # ОБРАБОТКА СООБЩЕНИЙ
 # ============================================
 
+processed_messages = set()  # ← Это ПЕРЕД функцией, на уровне модуля
+
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
+    
+    # ✅ НОВОЕ — защита от дублей (добавили в начало)
+    msg_id = message.message_id
+    if msg_id in processed_messages:
+        print(f"⚠️ Сообщение {msg_id} уже обработано — пропускаем")
+        return
+    processed_messages.add(msg_id)
+    if len(processed_messages) > 1000:
+        processed_messages.clear()
     text = message.text
     if not text or text.startswith('/') or len(text) < 10:
         return
