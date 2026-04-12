@@ -10,9 +10,6 @@ import os
 TOKEN        = os.environ.get("TOKEN", "")
 BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-# ============================================
-# НАСТРОЙКИ
-# ============================================
 
 # ============================================
 # ИСТОЧНИКИ ЧАТОВ → БИТРИКС24
@@ -68,7 +65,6 @@ REPAIR_TYPE_MAP = {
 REPAIR_TYPES_LIST = list(REPAIR_TYPE_MAP.keys())
 
 def get_type_id(category_name):
-    """Находит STATUS_ID по названию категории"""
     if not category_name:
         return None
     cat_lower = category_name.lower().strip()
@@ -76,7 +72,6 @@ def get_type_id(category_name):
         if name.lower() == cat_lower:
             print(f"🏷️ Категория точно: '{name}' → {status_id}")
             return status_id
-    # Нечёткий поиск если точного совпадения нет
     for name, status_id in REPAIR_TYPE_MAP.items():
         if cat_lower in name.lower() or name.lower() in cat_lower:
             print(f"🏷️ Категория приблизительно: '{name}' → {status_id}")
@@ -246,10 +241,8 @@ def send_to_bitrix(data, source_name, chat_title):
             print(f"⚠️ Нет телефона у {name}")
             return None, "no_phone", category
 
-        # Получаем TYPE_ID
         type_id = get_type_id(category)
 
-        # Комментарий для Битрикс
         comments = (
             f"📢 Источник: {source_name}\n"
             f"💬 Чат: {chat_title}\n"
@@ -264,19 +257,15 @@ def send_to_bitrix(data, source_name, chat_title):
 
         title = f"Ремонт | {name} | {address[:50]}"
 
-        # ----------------------------------------
         # ШАГ 1: Создаём контакт
-        # ----------------------------------------
-       contact_fields = {
-    "NAME":               name,
-    "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
-    "SOURCE_ID":          "UC_CRM_SOURCE",
-    "SOURCE_DESCRIPTION": source_name,
-    "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
-    
-    # ✅ Добавляем адрес в контакт
-    "ADDRESS":            address,
-}
+        contact_fields = {
+            "NAME":               name,
+            "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
+            "ADDRESS":            address,
+            "SOURCE_ID":          "UC_CRM_SOURCE",
+            "SOURCE_DESCRIPTION": source_name,
+            "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
+        }
 
         contact_resp = requests.post(
             BITRIX_URL + "crm.contact.add.json",
@@ -286,18 +275,17 @@ def send_to_bitrix(data, source_name, chat_title):
         contact_id = contact_resp.json().get('result')
         print(f"Контакт создан ID: {contact_id}")
 
-        # ----------------------------------------
         # ШАГ 2: Создаём лид
-        # ----------------------------------------
-       lead_fields = {
-    "TITLE":              title,
-    "NAME":               name,
-    "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
-    "ADDRESS":            address,  # ✅ уже есть
-    "COMMENTS":           comments,
-    "SOURCE_ID":          "UC_CRM_SOURCE",
-    "SOURCE_DESCRIPTION": source_name,
-}
+        lead_fields = {
+            "TITLE":              title,
+            "NAME":               name,
+            "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
+            "ADDRESS":            address,
+            "COMMENTS":           comments,
+            "SOURCE_ID":          "UC_CRM_SOURCE",
+            "SOURCE_DESCRIPTION": source_name,
+        }
+
         if contact_id:
             lead_fields["CONTACT_ID"] = contact_id
 
@@ -310,19 +298,15 @@ def send_to_bitrix(data, source_name, chat_title):
         lead_id     = lead_result.get('result')
         print(f"Лид создан ID: {lead_id} | Ответ: {lead_result}")
 
-        # ----------------------------------------
-        # ШАГ 3: Создаём сделку с TYPE_ID
-        # ----------------------------------------
+        # ШАГ 3: Создаём сделку
         deal_fields = {
-            "TITLE":              title,
-            "COMMENTS":           comments,
-            "SOURCE_ID":          "UC_CRM_SOURCE",
-            "SOURCE_DESCRIPTION": source_name,
-            # Адрес в пользовательское поле
+            "TITLE":                title,
+            "COMMENTS":             comments,
+            "SOURCE_ID":            "UC_CRM_SOURCE",
+            "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
         }
 
-        # Тип сделки — главное поле!
         if type_id:
             deal_fields["TYPE_ID"] = type_id
             print(f"✅ TYPE_ID установлен: {type_id} ({category})")
@@ -360,6 +344,12 @@ bot.remove_webhook()
 time.sleep(1)
 
 # ============================================
+# ЗАЩИТА ОТ ДУБЛЕЙ
+# ============================================
+
+processed_messages = set()
+
+# ============================================
 # КОМАНДЫ
 # ============================================
 
@@ -382,12 +372,10 @@ def cmd_test(message):
 # ОБРАБОТКА СООБЩЕНИЙ
 # ============================================
 
-processed_messages = set()  # ← Это ПЕРЕД функцией, на уровне модуля
-
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
-    
-    # ✅ НОВОЕ — защита от дублей (добавили в начало)
+
+    # Защита от дублей
     msg_id = message.message_id
     if msg_id in processed_messages:
         print(f"⚠️ Сообщение {msg_id} уже обработано — пропускаем")
@@ -395,6 +383,7 @@ def handle_message(message):
     processed_messages.add(msg_id)
     if len(processed_messages) > 1000:
         processed_messages.clear()
+
     text = message.text
     if not text or text.startswith('/') or len(text) < 10:
         return
@@ -419,7 +408,6 @@ def handle_message(message):
         print("⚠️ Лиды не найдены")
         return
 
-    # Счётчики для итогового сообщения
     success_count = 0
     report_lines  = []
 
@@ -435,7 +423,6 @@ def handle_message(message):
         if status == "ok":
             success_count += 1
             print(f"✅ Готово! ID:{lead_id} | {name} | {phone} | {category}")
-
             report_lines.append(
                 f"━━━━━━━━━━━━━━━\n"
                 f"🆔 Лид #{lead_id}\n"
@@ -462,12 +449,8 @@ def handle_message(message):
                 f"❌ Ошибка создания лида\n"
                 f"👤 {name} | 📞 {phone}"
             )
-
-    # ✅ Отправляем итоговое сообщение в чат
-    if report_lines:
-        header = f"✅ Создано лидов: {success_count}\n\n"
+                    header      = f"✅ Создано лидов: {success_count}\n\n"
         full_report = header + "\n\n".join(report_lines)
-        
         try:
             bot.send_message(message.chat.id, full_report)
         except Exception as e:
@@ -481,7 +464,6 @@ print("=" * 50)
 print("✅ Бот запущен!")
 print("=" * 50)
 
-# Новый код — сбрасываем всё перед стартом:
 bot.remove_webhook()
 time.sleep(3)
 
