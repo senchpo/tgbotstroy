@@ -267,13 +267,16 @@ def send_to_bitrix(data, source_name, chat_title):
         # ----------------------------------------
         # ШАГ 1: Создаём контакт
         # ----------------------------------------
-        contact_fields = {
-            "NAME":               name,
-            "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
-            "SOURCE_ID":          "UC_CRM_SOURCE",
-            "SOURCE_DESCRIPTION": source_name,
-            "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
-        }
+       contact_fields = {
+    "NAME":               name,
+    "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
+    "SOURCE_ID":          "UC_CRM_SOURCE",
+    "SOURCE_DESCRIPTION": source_name,
+    "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
+    
+    # ✅ Добавляем адрес в контакт
+    "ADDRESS":            address,
+}
 
         contact_resp = requests.post(
             BITRIX_URL + "crm.contact.add.json",
@@ -286,16 +289,15 @@ def send_to_bitrix(data, source_name, chat_title):
         # ----------------------------------------
         # ШАГ 2: Создаём лид
         # ----------------------------------------
-        lead_fields = {
-            "TITLE":              title,
-            "NAME":               name,
-            "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
-            "ADDRESS":            address,
-            "COMMENTS":           comments,
-            "SOURCE_ID":          "UC_CRM_SOURCE",
-            "SOURCE_DESCRIPTION": source_name,
-        }
-
+       lead_fields = {
+    "TITLE":              title,
+    "NAME":               name,
+    "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
+    "ADDRESS":            address,  # ✅ уже есть
+    "COMMENTS":           comments,
+    "SOURCE_ID":          "UC_CRM_SOURCE",
+    "SOURCE_DESCRIPTION": source_name,
+}
         if contact_id:
             lead_fields["CONTACT_ID"] = contact_id
 
