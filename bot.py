@@ -110,7 +110,6 @@ def check_duplicate_in_bitrix(phone):
     try:
         phone_clean = ''.join(filter(str.isdigit, phone))
         
-        # Убираем 8 в начале, заменяем на 7
         if len(phone_clean) == 11 and phone_clean.startswith('8'):
             phone_clean = '7' + phone_clean[1:]
         
@@ -133,12 +132,17 @@ def check_duplicate_in_bitrix(phone):
         result = response.json()
         print(f"🔍 Ответ дублей: {result}")
 
-        data = result.get('result', {})
+        # ✅ Проверяем что result это словарь, а не список
+        raw = result.get('result', {})
+        
+        if not raw or isinstance(raw, list):
+            print(f"✅ Дублей не найдено (пустой ответ)")
+            return False
 
-        # Проверяем все типы сущностей
-        leads    = data.get('LEAD',    [])
-        contacts = data.get('CONTACT', [])
-        deals    = data.get('DEAL',    [])
+        # Теперь безопасно делаем .get()
+        leads    = raw.get('LEAD',    [])
+        contacts = raw.get('CONTACT', [])
+        deals    = raw.get('DEAL',    [])
 
         if leads:
             print(f"⛔ Дубль в ЛИДАХ: {leads}")
@@ -155,7 +159,7 @@ def check_duplicate_in_bitrix(phone):
 
     except Exception as e:
         print(f"❌ Ошибка проверки дублей: {e}")
-        return False  # При ошибке НЕ блокируем создание!
+        return False
 
 # ============================================
 # AI ПАРСИНГ ЧЕРЕЗ GROQ
@@ -440,15 +444,16 @@ def cmd_test(message):
 # ============================================
 
 def set_reaction(chat_id, message_id, emoji="✅"):
-    """Ставим реакцию на сообщение"""
     try:
+        from telebot import types
+        reaction = types.ReactionTypeEmoji(emoji)
         bot.set_message_reaction(
             chat_id=chat_id,
             message_id=message_id,
-            reaction=[{"type": "emoji", "emoji": emoji}],
+            reaction=[reaction],
             is_big=False
         )
-        print(f"✅ Реакция {emoji} поставлена на сообщение {message_id}")
+        print(f"✅ Реакция {emoji} поставлена")
     except Exception as e:
         print(f"❌ Ошибка реакции: {e}")
 
