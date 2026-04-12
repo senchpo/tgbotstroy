@@ -109,59 +109,53 @@ lock               = threading.Lock()
 def check_duplicate_in_bitrix(phone):
     try:
         phone_clean = ''.join(filter(str.isdigit, phone))
+        
+        # Убираем 8 в начале, заменяем на 7
+        if len(phone_clean) == 11 and phone_clean.startswith('8'):
+            phone_clean = '7' + phone_clean[1:]
+        
         if len(phone_clean) < 10:
+            print(f"⚠️ Телефон слишком короткий: {phone_clean}")
             return False
 
         print(f"🔍 Проверяем дубль для: {phone_clean}")
 
-        # Проверяем в лидах
-        lead_resp = requests.post(
-            BITRIX_URL + "crm.lead.list.json",
+        response = requests.post(
+            BITRIX_URL + "crm.duplicate.findbycomm.json",
             json={
-                "filter": {"PHONE": phone_clean},
-                "select": ["ID", "TITLE"]
+                "type":        "PHONE",
+                "values":      [phone_clean],
+                "entity_type": "ALL"
             },
             timeout=10
         )
-        lead_result = lead_resp.json().get('result', [])
-        if lead_result:
-            print(f"⛔ Дубль в ЛИДАХ: ID={lead_result[0]['ID']}")
+
+        result = response.json()
+        print(f"🔍 Ответ дублей: {result}")
+
+        data = result.get('result', {})
+
+        # Проверяем все типы сущностей
+        leads    = data.get('LEAD',    [])
+        contacts = data.get('CONTACT', [])
+        deals    = data.get('DEAL',    [])
+
+        if leads:
+            print(f"⛔ Дубль в ЛИДАХ: {leads}")
+            return True
+        if contacts:
+            print(f"⛔ Дубль в КОНТАКТАХ: {contacts}")
+            return True
+        if deals:
+            print(f"⛔ Дубль в СДЕЛКАХ: {deals}")
             return True
 
-        # Проверяем в контактах
-        contact_resp = requests.post(
-            BITRIX_URL + "crm.contact.list.json",
-            json={
-                "filter": {"PHONE": phone_clean},
-                "select": ["ID", "NAME"]
-            },
-            timeout=10
-        )
-        contact_result = contact_resp.json().get('result', [])
-        if contact_result:
-            print(f"⛔ Дубль в КОНТАКТАХ: ID={contact_result[0]['ID']}")
-            return True
-
-        # Проверяем в сделках
-        deal_resp = requests.post(
-            BITRIX_URL + "crm.deal.list.json",
-            json={
-                "filter": {"PHONE": phone_clean},
-                "select": ["ID", "TITLE"]
-            },
-            timeout=10
-        )
-        deal_result = deal_resp.json().get('result', [])
-        if deal_result:
-            print(f"⛔ Дубль в СДЕЛКАХ: ID={deal_result[0]['ID']}")
-            return True
-
-        print(f"✅ Дублей нет")
+        print(f"✅ Дублей не найдено")
         return False
 
     except Exception as e:
         print(f"❌ Ошибка проверки дублей: {e}")
-        return False
+        return False  # При ошибке НЕ блокируем создание!
 
 # ============================================
 # AI ПАРСИНГ ЧЕРЕЗ GROQ
