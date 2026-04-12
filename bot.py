@@ -439,6 +439,20 @@ def cmd_test(message):
 # ОБРАБОТКА СООБЩЕНИЙ
 # ============================================
 
+def set_reaction(chat_id, message_id, emoji="✅"):
+    """Ставим реакцию на сообщение"""
+    try:
+        bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[{"type": "emoji", "emoji": emoji}],
+            is_big=False
+        )
+        print(f"✅ Реакция {emoji} поставлена на сообщение {message_id}")
+    except Exception as e:
+        print(f"❌ Ошибка реакции: {e}")
+
+
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
 
@@ -476,8 +490,10 @@ def handle_message(message):
         print("⚠️ Лиды не найдены")
         return
 
-    success_count = 0
-    report_lines  = []
+    success_count   = 0
+    duplicate_count = 0  # ✅ объявляем
+    skip_count      = 0  # ✅ объявляем
+    report_lines    = []
 
     for lead in leads:
         lead_id, status, category = send_to_bitrix(lead, source_name, chat_title)
@@ -502,6 +518,7 @@ def handle_message(message):
                 f"🏷️ {category}\n"
             )
         elif status == "duplicate":
+            duplicate_count += 1  # ✅ считаем
             print(f"⛔ Дубль: {name} | {phone}")
             report_lines.append(
                 f"━━━━━━━━━━━━━━━\n"
@@ -509,6 +526,7 @@ def handle_message(message):
                 f"👤 {name} | 📞 {phone}"
             )
         elif status == "no_phone":
+            skip_count += 1  # ✅ считаем
             print(f"⚠️ Пропущен (нет телефона): {name}")
             report_lines.append(
                 f"━━━━━━━━━━━━━━━\n"
@@ -523,15 +541,15 @@ def handle_message(message):
                 f"👤 {name} | 📞 {phone}"
             )
 
-    if report_lines:
-        header      = f"✅ Создано лидов: {success_count}\n\n"
-        full_report = header + "\n\n".join(report_lines)
-        try:
-            bot.send_message(message.chat.id, full_report)
-        except Exception as e:
-            print(f"❌ Ошибка отправки сообщения: {e}")
+    # ✅ Правильный отступ (4 пробела, не 3)
+    if success_count > 0:
+        set_reaction(message.chat.id, message.message_id, "✅")
 
+    elif duplicate_count > 0 and success_count == 0:
+        set_reaction(message.chat.id, message.message_id, "❌")
 
+    elif skip_count > 0 and success_count == 0:
+        set_reaction(message.chat.id, message.message_id, "🤔")
 # ============================================
 # ЗАПУСК
 # ============================================
