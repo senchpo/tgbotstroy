@@ -14,6 +14,7 @@ try:
 except IOError:
     print("❌ Уже запущен другой экземпляр! Выходим.")
     sys.exit(0)
+
 # ============================================
 # НАСТРОЙКИ
 # ============================================
@@ -128,37 +129,46 @@ def check_duplicate_in_bitrix(phone):
 
         print(f"🔍 Проверяем дубль для: {phone_clean}")
 
-        response = requests.post(
-            BITRIX_URL + "crm.duplicate.findbycomm.json",
+        # Проверяем в ЛИДАХ
+        lead_resp = requests.post(
+            BITRIX_URL + "crm.lead.list.json",
             json={
-                "type":        "PHONE",
-                "values":      [phone_clean],
-                "entity_type": "ALL"
+                "filter": {"PHONE": phone_clean},
+                "select": ["ID", "NAME", "PHONE"]
             },
             timeout=10
         )
-
-        result = response.json()
-        print(f"🔍 Ответ дублей: {result}")
-
-        raw = result.get('result', {})
-
-        if not raw or isinstance(raw, list):
-            print(f"✅ Дублей не найдено (пустой ответ)")
-            return False
-
-        leads    = raw.get('LEAD',    [])
-        contacts = raw.get('CONTACT', [])
-        deals    = raw.get('DEAL',    [])
-
-        if leads:
-            print(f"⛔ Дубль в ЛИДАХ: {leads}")
+        lead_result = lead_resp.json().get('result', [])
+        if lead_result:
+            print(f"⛔ Дубль в ЛИДАХ: {lead_result}")
             return True
-        if contacts:
-            print(f"⛔ Дубль в КОНТАКТАХ: {contacts}")
+
+        # Проверяем в КОНТАКТАХ
+        contact_resp = requests.post(
+            BITRIX_URL + "crm.contact.list.json",
+            json={
+                "filter": {"PHONE": phone_clean},
+                "select": ["ID", "NAME", "PHONE"]
+            },
+            timeout=10
+        )
+        contact_result = contact_resp.json().get('result', [])
+        if contact_result:
+            print(f"⛔ Дубль в КОНТАКТАХ: {contact_result}")
             return True
-        if deals:
-            print(f"⛔ Дубль в СДЕЛКАХ: {deals}")
+
+        # Проверяем в СДЕЛКАХ
+        deal_resp = requests.post(
+            BITRIX_URL + "crm.deal.list.json",
+            json={
+                "filter": {"PHONE": phone_clean},
+                "select": ["ID", "TITLE"]
+            },
+            timeout=10
+        )
+        deal_result = deal_resp.json().get('result', [])
+        if deal_result:
+            print(f"⛔ Дубль в СДЕЛКАХ: {deal_result}")
             return True
 
         print(f"✅ Дублей не найдено")
@@ -439,23 +449,33 @@ def cmd_test(message):
         bot.reply_to(message, f"❌ Нет связи: {e}")
 
 # ============================================
-# ОБРАБОТКА СООБЩЕНИЙ
+# РЕАКЦИИ
 # ============================================
 
-def set_reaction(chat_id, message_id, emoji="✅"):
+def set_reaction(chat_id, message_id, emoji="👍"):
     try:
+        VALID_REACTIONS = {
+            "✅": "👍",
+            "❌": "👎",
+            "🤔": "🤔",
+        }
+        safe_emoji = VALID_REACTIONS.get(emoji, "👍")
+
         from telebot import types
-        reaction = types.ReactionTypeEmoji(emoji)
+        reaction = types.ReactionTypeEmoji(safe_emoji)
         bot.set_message_reaction(
             chat_id=chat_id,
             message_id=message_id,
             reaction=[reaction],
             is_big=False
         )
-        print(f"✅ Реакция {emoji} поставлена")
+        print(f"✅ Реакция {safe_emoji} поставлена")
     except Exception as e:
         print(f"❌ Ошибка реакции: {e}")
 
+# ============================================
+# ОБРАБОТКА СООБЩЕНИЙ
+# ============================================
 
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
@@ -473,7 +493,7 @@ def handle_message(message):
     if not text or text.startswith('/') or len(text) < 10:
         return
 
-    # ✅ Игнорируем сообщения от ботов
+    # Игнорируем сообщения от ботов
     if message.from_user.is_bot:
         return
 
@@ -556,25 +576,27 @@ def handle_message(message):
         set_reaction(message.chat.id, message.message_id, "🤔")
 
 # ============================================
-# ЗАПУСК — ТОЛЬКО ОДИН РАЗ!
+# ЗАПУСК
 # ============================================
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("✅ Бот запущен!")
+    print("✅ Бот запускается...")
     print("=" * 50)
 
     try:
         bot.delete_webhook(drop_pending_updates=True)
         print("✅ Вебхук удалён")
     except Exception as e:
-        print(f"⚠️ Ошибка: {e}")
+        print(f"⚠️ Ошибка удаления вебхука: {e}")
 
-    time.sleep(3)
+    print("⏳ Ждём 15 секунд перед стартом...")
+    time.sleep(15)
+
+    print("🚀 Запускаем polling!")
 
     while True:
         try:
-            print("🔄 Запускаем polling...")
             bot.polling(
                 none_stop=True,
                 interval=2,
@@ -583,5 +605,9 @@ if __name__ == "__main__":
             )
         except Exception as e:
             print(f"❌ Polling упал: {e}")
-            print("🔄 Перезапуск через 10 секунд...")
-            time.sleep(10)
+            if "409" in str(e):
+                print("⏳ Конфликт! Ждём 30 секунд...")
+                time.sleep(30)
+            else:
+                print("🔄 Перезапуск через 10 секунд...")
+                time.sleep(10)
