@@ -15,17 +15,9 @@ except IOError:
     print("❌ Уже запущен другой экземпляр! Выходим.")
     sys.exit(0)
 
-# ============================================
-# НАСТРОЙКИ
-# ============================================
-
 TOKEN        = os.environ.get("TOKEN", "")
 BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-
-# ============================================
-# ИСТОЧНИКИ ЧАТОВ
-# ============================================
 
 CHAT_SOURCE_MAP = {
     'авито':        'Реклама Авито',
@@ -44,13 +36,8 @@ def get_source_from_chat(chat_title):
     chat_lower = chat_title.lower().replace(' ', '')
     for keyword, source_name in CHAT_SOURCE_MAP.items():
         if keyword.lower() in chat_lower:
-            print(f"✅ Чат '{chat_title}' → {source_name}")
             return source_name
     return f'Telegram: {chat_title}'
-
-# ============================================
-# ТИП СДЕЛКИ
-# ============================================
 
 REPAIR_TYPE_MAP = {
     "Ремонт сан узла Капитальный":      "SALE",
@@ -82,18 +69,11 @@ def get_type_id(category_name):
     cat_lower = category_name.lower().strip()
     for name, status_id in REPAIR_TYPE_MAP.items():
         if name.lower() == cat_lower:
-            print(f"🏷️ Категория точно: '{name}' → {status_id}")
             return status_id
     for name, status_id in REPAIR_TYPE_MAP.items():
         if cat_lower in name.lower() or name.lower() in cat_lower:
-            print(f"🏷️ Категория приблизительно: '{name}' → {status_id}")
             return status_id
-    print(f"⚠️ Категория не найдена: '{category_name}'")
     return None
-
-# ============================================
-# КЛЮЧЕВЫЕ СЛОВА
-# ============================================
 
 KEYWORDS = [
     'ремонт', 'кв.м', 'м2', 'квартира', 'квартиру',
@@ -105,63 +85,47 @@ KEYWORDS = [
 ]
 
 # ============================================
-# ГЛОБАЛЬНЫЙ ЗАМОК ОТ ДУБЛЕЙ
+# ГЛОБАЛЬНЫЕ ЗАМКИ
 # ============================================
 
-processed_messages = set()
-processing_phones  = set()
 lock               = threading.Lock()
+processed_messages = set()   # уже обработанные message_id
+done_phones        = set()   # телефоны которые УЖЕ создали лид в этой сессии
+processing_phones  = set()   # телефоны которые ПРЯМО СЕЙЧАС создаются
 
 # ============================================
-# ПРОВЕРКА ДУБЛЕЙ В БИТРИКС24
+# ПРОВЕРКА ДУБЛЕЙ
 # ============================================
 
-def check_duplicate_in_bitrix(phone):
+def check_duplicate_in_bitrix(phone_clean):
     try:
-        phone_clean = ''.join(filter(str.isdigit, phone))
-
-        if len(phone_clean) == 11 and phone_clean.startswith('8'):
-            phone_clean = '7' + phone_clean[1:]
-
-        if len(phone_clean) < 10:
-            print(f"⚠️ Телефон слишком короткий: {phone_clean}")
-            return False
-
         print(f"🔍 Проверяем дубль для: {phone_clean}")
 
-        # Проверяем в ЛИДАХ
         lead_resp = requests.post(
             BITRIX_URL + "crm.lead.list.json",
             json={
                 "filter": {"PHONE": phone_clean},
-                "select": ["ID", "NAME", "PHONE"]
+                "select": ["ID", "NAME"]
             },
             timeout=10
         )
-        lead_data = lead_resp.json()
-        print(f"📋 Лиды ответ: {lead_data}")
-        lead_result = lead_data.get('result', [])
+        lead_result = lead_resp.json().get('result', [])
         if lead_result:
             print(f"⛔ Дубль в ЛИДАХ: {lead_result}")
             return True
 
-        # Проверяем в КОНТАКТАХ
         contact_resp = requests.post(
             BITRIX_URL + "crm.contact.list.json",
             json={
                 "filter": {"PHONE": phone_clean},
-                "select": ["ID", "NAME", "PHONE"]
+                "select": ["ID", "NAME"]
             },
             timeout=10
         )
-        contact_data = contact_resp.json()
-        print(f"📋 Контакты ответ: {contact_data}")
-        contact_result = contact_data.get('result', [])
+        contact_result = contact_resp.json().get('result', [])
         if contact_result:
             print(f"⛔ Дубль в КОНТАКТАХ: {contact_result}")
             return True
-
-        # ❌ СДЕЛКИ УБРАЛИ — не поддерживают фильтр по телефону!
 
         print(f"✅ Дублей не найдено для: {phone_clean}")
         return False
@@ -171,7 +135,7 @@ def check_duplicate_in_bitrix(phone):
         return False
 
 # ============================================
-# AI ПАРСИНГ ЧЕРЕЗ GROQ
+# AI ПАРСИНГ
 # ============================================
 
 def parse_lead_ai(text):
@@ -240,9 +204,7 @@ def parse_lead_ai(text):
             timeout=30
         )
 
-        print(f"Groq статус: {response.status_code}")
         result_json = response.json()
-
         if 'error' in result_json:
             print(f"❌ Groq ошибка: {result_json['error']}")
             return []
@@ -291,54 +253,64 @@ def parse_lead_ai(text):
         return []
 
 # ============================================
-# ОТПРАВКА В БИТРИКС24
+# ОТПРАВКА В БИТРИКС
 # ============================================
 
 def send_to_bitrix(data, source_name, chat_title):
+    phone    = data.get('phone', '').strip()
+    name     = data.get('name', 'Не указано').strip()
+    address  = data.get('address', 'Не указано').strip()
+    volume   = data.get('work_volume', 'Не указано').strip()
+    deadline = data.get('deadline', 'Не указано').strip()
+    comment  = data.get('comment', 'Не указано').strip()
+    category = data.get('category', '').strip()
+    raw_text = data.get('raw_text', '')
+
+    if not phone or phone == 'Не указано':
+        return None, "no_phone", category
+
+    phone_clean = ''.join(filter(str.isdigit, phone))
+    if len(phone_clean) == 11 and phone_clean.startswith('8'):
+        phone_clean = '7' + phone_clean[1:]
+
+    # ✅ ГЛАВНЫЙ ЗАМОК — проверка + добавление атомарно
+    with lock:
+        if phone_clean in processing_phones:
+            print(f"⛔ Телефон {phone_clean} уже обрабатывается прямо сейчас!")
+            return None, "duplicate", category
+
+        if phone_clean in done_phones:
+            print(f"⛔ Телефон {phone_clean} уже создан в этой сессии!")
+            return None, "duplicate", category
+
+        # Проверяем Битрикс пока держим лок
+        is_dup = check_duplicate_in_bitrix(phone_clean)
+        if is_dup:
+            return None, "duplicate", category
+
+        # Сразу резервируем телефон
+        processing_phones.add(phone_clean)
+
     try:
-        phone    = data.get('phone', '').strip()
-        name     = data.get('name', 'Не указано').strip()
-        address  = data.get('address', 'Не указано').strip()
-        volume   = data.get('work_volume', 'Не указано').strip()
-        deadline = data.get('deadline', 'Не указано').strip()
-        comment  = data.get('comment', 'Не указано').strip()
-        category = data.get('category', '').strip()
-        raw_text = data.get('raw_text', '')
+        type_id = get_type_id(category)
 
-        if not phone or phone == 'Не указано':
-            print(f"⚠️ Нет телефона у {name}")
-            return None, "no_phone", category
+        comments = (
+            f"📢 Источник: {source_name}\n"
+            f"💬 Чат: {chat_title}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📐 Объём: {volume}\n"
+            f"📅 Срок: {deadline}\n"
+            f"🏷️ Тип ремонта: {category}\n"
+            f"💬 Комментарий: {comment}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📩 Исходное сообщение:\n{raw_text[:800]}"
+        )
 
-        phone_clean = ''.join(filter(str.isdigit, phone))
+        title = f"Ремонт | {name} | {address[:50]}"
 
-        with lock:
-            if phone_clean in processing_phones:
-                print(f"⛔ Телефон {phone_clean} уже создаётся прямо сейчас!")
-                return None, "duplicate", category
-            processing_phones.add(phone_clean)
-
-        try:
-            if check_duplicate_in_bitrix(phone):
-                print(f"⛔ Пропускаем дубль: {name} | {phone}")
-                return None, "duplicate", category
-
-            type_id = get_type_id(category)
-
-            comments = (
-                f"📢 Источник: {source_name}\n"
-                f"💬 Чат: {chat_title}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"📐 Объём: {volume}\n"
-                f"📅 Срок: {deadline}\n"
-                f"🏷️ Тип ремонта: {category}\n"
-                f"💬 Комментарий: {comment}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"📩 Исходное сообщение:\n{raw_text[:800]}"
-            )
-
-            title = f"Ремонт | {name} | {address[:50]}"
-
-            contact_fields = {
+        contact_resp = requests.post(
+            BITRIX_URL + "crm.contact.add.json",
+            json={"fields": {
                 "NAME":               name,
                 "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
                 "ADDRESS":            address,
@@ -346,84 +318,77 @@ def send_to_bitrix(data, source_name, chat_title):
                 "SOURCE_DESCRIPTION": source_name,
                 "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
                 "ASSIGNED_BY_ID":     0,
-            }
+            }},
+            timeout=10
+        )
+        contact_id = contact_resp.json().get('result')
+        print(f"Контакт создан ID: {contact_id}")
 
-            contact_resp = requests.post(
-                BITRIX_URL + "crm.contact.add.json",
-                json={"fields": contact_fields},
-                timeout=10
-            )
-            contact_id = contact_resp.json().get('result')
-            print(f"Контакт создан ID: {contact_id}")
+        lead_fields = {
+            "TITLE":              title,
+            "NAME":               name,
+            "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
+            "ADDRESS":            address,
+            "COMMENTS":           comments,
+            "SOURCE_ID":          "UC_CRM_SOURCE",
+            "SOURCE_DESCRIPTION": source_name,
+            "ASSIGNED_BY_ID":     0,
+        }
+        if contact_id:
+            lead_fields["CONTACT_ID"] = contact_id
 
-            lead_fields = {
-                "TITLE":              title,
-                "NAME":               name,
-                "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
-                "ADDRESS":            address,
-                "COMMENTS":           comments,
-                "SOURCE_ID":          "UC_CRM_SOURCE",
-                "SOURCE_DESCRIPTION": source_name,
-                "ASSIGNED_BY_ID":     0,
-            }
+        lead_resp = requests.post(
+            BITRIX_URL + "crm.lead.add.json",
+            json={"fields": lead_fields},
+            timeout=10
+        )
+        lead_id = lead_resp.json().get('result')
+        print(f"Лид создан ID: {lead_id}")
 
-            if contact_id:
-                lead_fields["CONTACT_ID"] = contact_id
+        deal_fields = {
+            "TITLE":                title,
+            "COMMENTS":             comments,
+            "SOURCE_ID":            "UC_CRM_SOURCE",
+            "SOURCE_DESCRIPTION":   source_name,
+            "UF_CRM_1775766366237": address,
+            "ASSIGNED_BY_ID":       0,
+        }
+        if type_id:
+            deal_fields["TYPE_ID"] = type_id
+        if contact_id:
+            deal_fields["CONTACT_IDS"] = [contact_id]
+        if lead_id:
+            deal_fields["LEAD_ID"] = lead_id
 
-            lead_resp = requests.post(
-                BITRIX_URL + "crm.lead.add.json",
-                json={"fields": lead_fields},
-                timeout=10
-            )
-            lead_id = lead_resp.json().get('result')
-            print(f"Лид создан ID: {lead_id}")
+        deal_resp = requests.post(
+            BITRIX_URL + "crm.deal.add.json",
+            json={"fields": deal_fields},
+            timeout=10
+        )
+        deal_id = deal_resp.json().get('result')
+        print(f"Сделка создана ID: {deal_id}")
 
-            deal_fields = {
-                "TITLE":                title,
-                "COMMENTS":             comments,
-                "SOURCE_ID":            "UC_CRM_SOURCE",
-                "SOURCE_DESCRIPTION":   source_name,
-                "UF_CRM_1775766366237": address,
-                "ASSIGNED_BY_ID":       0,
-            }
-
-            if type_id:
-                deal_fields["TYPE_ID"] = type_id
-            if contact_id:
-                deal_fields["CONTACT_IDS"] = [contact_id]
-            if lead_id:
-                deal_fields["LEAD_ID"] = lead_id
-
-            deal_resp = requests.post(
-                BITRIX_URL + "crm.deal.add.json",
-                json={"fields": deal_fields},
-                timeout=10
-            )
-            deal_id = deal_resp.json().get('result')
-            print(f"Сделка создана ID: {deal_id}")
-
-            if lead_id or deal_id:
-                return lead_id or deal_id, "ok", category
-
-            return None, "bitrix_error", category
-
-        finally:
+        if lead_id or deal_id:
             with lock:
+                done_phones.add(phone_clean)      # ✅ запомнили навсегда в сессии
                 processing_phones.discard(phone_clean)
+            return lead_id or deal_id, "ok", category
+
+        with lock:
+            processing_phones.discard(phone_clean)
+        return None, "bitrix_error", category
 
     except Exception as e:
         print(f"❌ Битрикс ошибка: {e}")
+        with lock:
+            processing_phones.discard(phone_clean)
         return None, "error", category
 
 # ============================================
-# ИНИЦИАЛИЗАЦИЯ БОТА
+# БОТ
 # ============================================
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
-
-# ============================================
-# КОМАНДЫ
-# ============================================
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
@@ -440,10 +405,6 @@ def cmd_test(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Нет связи: {e}")
 
-# ============================================
-# РЕАКЦИИ
-# ============================================
-
 def set_reaction(chat_id, message_id, emoji="👍"):
     try:
         VALID_REACTIONS = {
@@ -452,7 +413,6 @@ def set_reaction(chat_id, message_id, emoji="👍"):
             "🤔": "🤔",
         }
         safe_emoji = VALID_REACTIONS.get(emoji, "👍")
-
         from telebot import types
         reaction = types.ReactionTypeEmoji(safe_emoji)
         bot.set_message_reaction(
@@ -465,14 +425,11 @@ def set_reaction(chat_id, message_id, emoji="👍"):
     except Exception as e:
         print(f"❌ Ошибка реакции: {e}")
 
-# ============================================
-# ОБРАБОТКА СООБЩЕНИЙ
-# ============================================
-
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
 
     msg_key = f"{message.chat.id}_{message.message_id}"
+
     with lock:
         if msg_key in processed_messages:
             print(f"⚠️ Сообщение {msg_key} уже обработано — пропускаем")
@@ -485,8 +442,7 @@ def handle_message(message):
     if not text or text.startswith('/') or len(text) < 10:
         return
 
-    # Игнорируем сообщения от ботов
-    if message.from_user.is_bot:
+    if message.from_user and message.from_user.is_bot:
         return
 
     text_lower = text.lower()
@@ -504,7 +460,6 @@ def handle_message(message):
     print(f"{'='*50}")
 
     leads = parse_lead_ai(text)
-
     if not leads:
         print("⚠️ Лиды не найдены")
         return
@@ -512,59 +467,29 @@ def handle_message(message):
     success_count   = 0
     duplicate_count = 0
     skip_count      = 0
-    report_lines    = []
 
     for lead in leads:
         lead_id, status, category = send_to_bitrix(lead, source_name, chat_title)
-
-        name     = lead.get('name', '—')
-        phone    = lead.get('phone', '—')
-        address  = lead.get('address', 'Не указано')
-        volume   = lead.get('work_volume', 'Не указано')
-        deadline = lead.get('deadline', 'Не указано')
+        name  = lead.get('name', '—')
+        phone = lead.get('phone', '—')
 
         if status == "ok":
             success_count += 1
             print(f"✅ Готово! ID:{lead_id} | {name} | {phone} | {category}")
-            report_lines.append(
-                f"━━━━━━━━━━━━━━━\n"
-                f"🆔 Лид #{lead_id}\n"
-                f"👤 {name}\n"
-                f"📞 {phone}\n"
-                f"📍 {address}\n"
-                f"📐 {volume}\n"
-                f"📅 {deadline}\n"
-                f"🏷️ {category}\n"
-            )
         elif status == "duplicate":
             duplicate_count += 1
             print(f"⛔ Дубль: {name} | {phone}")
-            report_lines.append(
-                f"━━━━━━━━━━━━━━━\n"
-                f"⛔ Дубль — уже есть в Битрикс\n"
-                f"👤 {name} | 📞 {phone}"
-            )
         elif status == "no_phone":
             skip_count += 1
-            print(f"⚠️ Пропущен (нет телефона): {name}")
-            report_lines.append(
-                f"━━━━━━━━━━━━━━━\n"
-                f"⚠️ Пропущен (нет телефона)\n"
-                f"👤 {name}"
-            )
+            print(f"⚠️ Нет телефона: {name}")
         else:
             print(f"❌ Ошибка для: {name}")
-            report_lines.append(
-                f"━━━━━━━━━━━━━━━\n"
-                f"❌ Ошибка создания лида\n"
-                f"👤 {name} | 📞 {phone}"
-            )
 
     if success_count > 0:
         set_reaction(message.chat.id, message.message_id, "✅")
-    elif duplicate_count > 0 and success_count == 0:
+    elif duplicate_count > 0:
         set_reaction(message.chat.id, message.message_id, "❌")
-    elif skip_count > 0 and success_count == 0:
+    elif skip_count > 0:
         set_reaction(message.chat.id, message.message_id, "🤔")
 
 # ============================================
@@ -578,7 +503,7 @@ if __name__ == "__main__":
 
     try:
         bot.delete_webhook(drop_pending_updates=True)
-        print("✅ Вебхук удалён")
+        print("✅ Вебхук удалён, pending updates сброшены")
     except Exception as e:
         print(f"⚠️ Ошибка удаления вебхука: {e}")
 
