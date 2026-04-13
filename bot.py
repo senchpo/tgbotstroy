@@ -94,51 +94,62 @@ def check_duplicate_in_bitrix(phone_clean):
     try:
         print(f"🔍 Проверяем дубль для: {phone_clean}")
 
-        # ✅ Метод 1: официальный поиск дублей
+        # ✅ Метод 1: crm.duplicate.findbycomm
         resp = requests.post(
             BITRIX_URL + "crm.duplicate.findbycomm.json",
             json={
-                "type":        "PHONE",
-                "values":      [phone_clean],
+                "type": "PHONE",
+                "values": [phone_clean],
                 "entity_type": "ALL"
             },
             timeout=10
         )
 
-        data   = resp.json()
+        data = resp.json()
         result = data.get('result', {})
         print(f"crm.duplicate.findbycomm: {result}")
 
-        if result.get('LEAD') or result.get('CONTACT') or result.get('DEAL'):
-            print(f"⛔ Найден дубль через findbycomm: {result}")
+        # ✅ Проверяем что result это словарь а не список
+        if isinstance(result, dict):
+            if result.get('LEAD') or result.get('CONTACT') or result.get('DEAL'):
+                print(f"⛔ Найден дубль: {result}")
+                return True
+        elif isinstance(result, list) and len(result) > 0:
+            print(f"⛔ Найден дубль (список): {result}")
             return True
 
-        # ✅ Метод 2: дополнительно проверяем лиды
+        # ✅ Метод 2: проверяем лиды
         lead_resp = requests.post(
             BITRIX_URL + "crm.lead.list.json",
             json={
                 "filter": {"PHONE": phone_clean},
-                "select": ["ID", "NAME"]
+                "select": ["ID", "NAME", "PHONE"]
             },
             timeout=10
         )
         lead_data = lead_resp.json()
-        if lead_data.get('result'):
-            print(f"⛔ Дубль в ЛИДАХ: {lead_data['result']}")
+        lead_result = lead_data.get('result', [])
+        print(f"crm.lead.list: {lead_result}")
+
+        if isinstance(lead_result, list) and len(lead_result) > 0:
+            print(f"⛔ Дубль в ЛИДАХ: {lead_result}")
             return True
 
-        # ✅ Метод 3: дополнительно проверяем контакты
+        # ✅ Метод 3: проверяем контакты
         contact_resp = requests.post(
             BITRIX_URL + "crm.contact.list.json",
             json={
                 "filter": {"PHONE": phone_clean},
-                "select": ["ID", "NAME"]
+                "select": ["ID", "NAME", "PHONE"]
             },
             timeout=10
         )
         contact_data = contact_resp.json()
-        if contact_data.get('result'):
-            print(f"⛔ Дубль в КОНТАКТАХ: {contact_data['result']}")
+        contact_result = contact_data.get('result', [])
+        print(f"crm.contact.list: {contact_result}")
+
+        if isinstance(contact_result, list) and len(contact_result) > 0:
+            print(f"⛔ Дубль в КОНТАКТАХ: {contact_result}")
             return True
 
         print(f"✅ Дублей нет для: {phone_clean}")
@@ -146,7 +157,8 @@ def check_duplicate_in_bitrix(phone_clean):
 
     except Exception as e:
         print(f"❌ Ошибка проверки дублей: {e}")
-        return False
+        # ✅ При ошибке НЕ создаём лид — безопаснее
+        return True  # ← было False, теперь True!
 
 # ============================================
 # AI ПАРСИНГ
