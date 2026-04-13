@@ -95,11 +95,10 @@ KEYWORDS = [
 
 # ============================================
 # ГЛОБАЛЬНЫЙ ЗАМОК ОТ ДУБЛЕЙ
-# ← Защита от двойной обработки одного сообщения
 # ============================================
 
 processed_messages = set()
-processing_phones  = set()        # телефоны в процессе создания прямо сейчас
+processing_phones  = set()
 lock               = threading.Lock()
 
 # ============================================
@@ -109,10 +108,10 @@ lock               = threading.Lock()
 def check_duplicate_in_bitrix(phone):
     try:
         phone_clean = ''.join(filter(str.isdigit, phone))
-        
+
         if len(phone_clean) == 11 and phone_clean.startswith('8'):
             phone_clean = '7' + phone_clean[1:]
-        
+
         if len(phone_clean) < 10:
             print(f"⚠️ Телефон слишком короткий: {phone_clean}")
             return False
@@ -132,14 +131,12 @@ def check_duplicate_in_bitrix(phone):
         result = response.json()
         print(f"🔍 Ответ дублей: {result}")
 
-        # ✅ Проверяем что result это словарь, а не список
         raw = result.get('result', {})
-        
+
         if not raw or isinstance(raw, list):
             print(f"✅ Дублей не найдено (пустой ответ)")
             return False
 
-        # Теперь безопасно делаем .get()
         leads    = raw.get('LEAD',    [])
         contacts = raw.get('CONTACT', [])
         deals    = raw.get('DEAL',    [])
@@ -296,14 +293,12 @@ def send_to_bitrix(data, source_name, chat_title):
         category = data.get('category', '').strip()
         raw_text = data.get('raw_text', '')
 
-        # ШАГ 1: Проверка телефона
         if not phone or phone == 'Не указано':
             print(f"⚠️ Нет телефона у {name}")
             return None, "no_phone", category
 
         phone_clean = ''.join(filter(str.isdigit, phone))
 
-        # ШАГ 2: Блокировка — защита от параллельного создания
         with lock:
             if phone_clean in processing_phones:
                 print(f"⛔ Телефон {phone_clean} уже создаётся прямо сейчас!")
@@ -311,12 +306,10 @@ def send_to_bitrix(data, source_name, chat_title):
             processing_phones.add(phone_clean)
 
         try:
-            # ШАГ 3: Проверка дублей в Битрикс
             if check_duplicate_in_bitrix(phone):
                 print(f"⛔ Пропускаем дубль: {name} | {phone}")
                 return None, "duplicate", category
 
-            # ШАГ 4: Получаем тип сделки
             type_id = get_type_id(category)
 
             comments = (
@@ -333,7 +326,6 @@ def send_to_bitrix(data, source_name, chat_title):
 
             title = f"Ремонт | {name} | {address[:50]}"
 
-            # ШАГ 5: Создаём контакт БЕЗ ответственного
             contact_fields = {
                 "NAME":               name,
                 "PHONE":              [{"VALUE": phone, "VALUE_TYPE": "WORK"}],
@@ -341,7 +333,7 @@ def send_to_bitrix(data, source_name, chat_title):
                 "SOURCE_ID":          "UC_CRM_SOURCE",
                 "SOURCE_DESCRIPTION": source_name,
                 "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
-                "ASSIGNED_BY_ID":     0,   # ← БЕЗ ответственного
+                "ASSIGNED_BY_ID":     0,
             }
 
             contact_resp = requests.post(
@@ -352,7 +344,6 @@ def send_to_bitrix(data, source_name, chat_title):
             contact_id = contact_resp.json().get('result')
             print(f"Контакт создан ID: {contact_id}")
 
-            # ШАГ 6: Создаём лид БЕЗ ответственного
             lead_fields = {
                 "TITLE":              title,
                 "NAME":               name,
@@ -361,13 +352,13 @@ def send_to_bitrix(data, source_name, chat_title):
                 "COMMENTS":           comments,
                 "SOURCE_ID":          "UC_CRM_SOURCE",
                 "SOURCE_DESCRIPTION": source_name,
-                "ASSIGNED_BY_ID":     0,   # ← БЕЗ ответственного
+                "ASSIGNED_BY_ID":     0,
             }
 
             if contact_id:
                 lead_fields["CONTACT_ID"] = contact_id
 
-            lead_resp   = requests.post(
+            lead_resp = requests.post(
                 BITRIX_URL + "crm.lead.add.json",
                 json={"fields": lead_fields},
                 timeout=10
@@ -375,14 +366,13 @@ def send_to_bitrix(data, source_name, chat_title):
             lead_id = lead_resp.json().get('result')
             print(f"Лид создан ID: {lead_id}")
 
-            # ШАГ 7: Создаём сделку БЕЗ ответственного
             deal_fields = {
                 "TITLE":                title,
                 "COMMENTS":             comments,
                 "SOURCE_ID":            "UC_CRM_SOURCE",
                 "SOURCE_DESCRIPTION":   source_name,
                 "UF_CRM_1775766366237": address,
-                "ASSIGNED_BY_ID":       0,   # ← БЕЗ ответственного
+                "ASSIGNED_BY_ID":       0,
             }
 
             if type_id:
@@ -406,7 +396,6 @@ def send_to_bitrix(data, source_name, chat_title):
             return None, "bitrix_error", category
 
         finally:
-            # Снимаем блокировку телефона
             with lock:
                 processing_phones.discard(phone_clean)
 
@@ -418,7 +407,7 @@ def send_to_bitrix(data, source_name, chat_title):
 # ИНИЦИАЛИЗАЦИЯ БОТА
 # ============================================
 
-bot = telebot.TeleBot(TOKEN, threaded=False)  # ← threaded=False убирает дубли!
+bot = telebot.TeleBot(TOKEN, threaded=False)
 
 # ============================================
 # КОМАНДЫ
@@ -461,7 +450,6 @@ def set_reaction(chat_id, message_id, emoji="✅"):
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
 
-    # Защита от дублей по ID сообщения
     msg_key = f"{message.chat.id}_{message.message_id}"
     with lock:
         if msg_key in processed_messages:
@@ -473,6 +461,10 @@ def handle_message(message):
 
     text = message.text
     if not text or text.startswith('/') or len(text) < 10:
+        return
+
+    # ✅ Игнорируем сообщения от ботов
+    if message.from_user.is_bot:
         return
 
     text_lower = text.lower()
@@ -496,8 +488,8 @@ def handle_message(message):
         return
 
     success_count   = 0
-    duplicate_count = 0  # ✅ объявляем
-    skip_count      = 0  # ✅ объявляем
+    duplicate_count = 0
+    skip_count      = 0
     report_lines    = []
 
     for lead in leads:
@@ -523,7 +515,7 @@ def handle_message(message):
                 f"🏷️ {category}\n"
             )
         elif status == "duplicate":
-            duplicate_count += 1  # ✅ считаем
+            duplicate_count += 1
             print(f"⛔ Дубль: {name} | {phone}")
             report_lines.append(
                 f"━━━━━━━━━━━━━━━\n"
@@ -531,7 +523,7 @@ def handle_message(message):
                 f"👤 {name} | 📞 {phone}"
             )
         elif status == "no_phone":
-            skip_count += 1  # ✅ считаем
+            skip_count += 1
             print(f"⚠️ Пропущен (нет телефона): {name}")
             report_lines.append(
                 f"━━━━━━━━━━━━━━━\n"
@@ -546,17 +538,15 @@ def handle_message(message):
                 f"👤 {name} | 📞 {phone}"
             )
 
-    # ✅ Правильный отступ (4 пробела, не 3)
     if success_count > 0:
         set_reaction(message.chat.id, message.message_id, "✅")
-
     elif duplicate_count > 0 and success_count == 0:
         set_reaction(message.chat.id, message.message_id, "❌")
-
     elif skip_count > 0 and success_count == 0:
         set_reaction(message.chat.id, message.message_id, "🤔")
+
 # ============================================
-# ЗАПУСК
+# ЗАПУСК — ТОЛЬКО ОДИН РАЗ!
 # ============================================
 
 if __name__ == "__main__":
@@ -570,7 +560,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"⚠️ Ошибка: {e}")
 
-    time.sleep(5)
+    time.sleep(3)
 
     while True:
         try:
