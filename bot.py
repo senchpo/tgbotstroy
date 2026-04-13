@@ -3,7 +3,17 @@ import requests
 import time
 import os
 import threading
+import fcntl
+import sys
 
+# ✅ Запрещаем второй экземпляр
+_lock_file = open('/tmp/bot_instance.lock', 'w')
+try:
+    fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("✅ Единственный экземпляр — продолжаем")
+except IOError:
+    print("❌ Уже запущен другой экземпляр! Выходим.")
+    sys.exit(0)
 # ============================================
 # НАСТРОЙКИ
 # ============================================
