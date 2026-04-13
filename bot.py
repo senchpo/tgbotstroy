@@ -138,7 +138,9 @@ def check_duplicate_in_bitrix(phone):
             },
             timeout=10
         )
-        lead_result = lead_resp.json().get('result', [])
+        lead_data = lead_resp.json()
+        print(f"📋 Лиды ответ: {lead_data}")
+        lead_result = lead_data.get('result', [])
         if lead_result:
             print(f"⛔ Дубль в ЛИДАХ: {lead_result}")
             return True
@@ -152,26 +154,16 @@ def check_duplicate_in_bitrix(phone):
             },
             timeout=10
         )
-        contact_result = contact_resp.json().get('result', [])
+        contact_data = contact_resp.json()
+        print(f"📋 Контакты ответ: {contact_data}")
+        contact_result = contact_data.get('result', [])
         if contact_result:
             print(f"⛔ Дубль в КОНТАКТАХ: {contact_result}")
             return True
 
-        # Проверяем в СДЕЛКАХ
-        deal_resp = requests.post(
-            BITRIX_URL + "crm.deal.list.json",
-            json={
-                "filter": {"PHONE": phone_clean},
-                "select": ["ID", "TITLE"]
-            },
-            timeout=10
-        )
-        deal_result = deal_resp.json().get('result', [])
-        if deal_result:
-            print(f"⛔ Дубль в СДЕЛКАХ: {deal_result}")
-            return True
+        # ❌ СДЕЛКИ УБРАЛИ — не поддерживают фильтр по телефону!
 
-        print(f"✅ Дублей не найдено")
+        print(f"✅ Дублей не найдено для: {phone_clean}")
         return False
 
     except Exception as e:
