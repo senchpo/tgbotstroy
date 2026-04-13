@@ -1,21 +1,8 @@
 import telebot
 import requests
+import redis
 import time
 import os
-import threading
-import fcntl
-import sys
-
-# ============================================
-# ФАЙЛОВЫЕ ДИРЕКТОРИИ
-# ============================================
-
-PHONE_LOCK_DIR    = "/tmp/phone_locks"
-PROCESSED_MSG_DIR = "/tmp/processed_msgs"
-INSTANCE_LOCK     = "/tmp/bot_instance.lock"
-
-os.makedirs(PHONE_LOCK_DIR, exist_ok=True)
-os.makedirs(PROCESSED_MSG_DIR, exist_ok=True)
 
 # ============================================
 # КОНФИГ
@@ -24,6 +11,23 @@ os.makedirs(PROCESSED_MSG_DIR, exist_ok=True)
 TOKEN        = os.environ.get("TOKEN", "")
 BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+REDIS_URL    = os.environ.get("REDIS_URL", "")
+
+# ============================================
+# REDIS ПОДКЛЮЧЕНИЕ
+# ============================================
+
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    print("✅ Redis подключён!")
+except Exception as e:
+    print(f"❌ Redis не подключён: {e}")
+    redis_client = None
+
+# ============================================
+# КАРТЫ И КОНСТАНТЫ
+# ============================================
 
 CHAT_SOURCE_MAP = {
     'авито':        'Реклама Авито',
@@ -71,94 +75,74 @@ KEYWORDS = [
 ]
 
 # ============================================
-# ФАЙЛОВЫЕ ЛОКИ ДЛЯ СООБЩЕНИЙ
+# REDIS ФУНКЦИИ
 # ============================================
 
 def is_message_processed(msg_key):
     """
     Атомарно проверяет и помечает сообщение как обработанное.
-    Работает между разными процессами через файл.
-    Возвращает True если уже обработано, False если мы первые.
+    SET NX — атомарная операция, работает между любыми процессами.
+    TTL 1 час.
     """
-    # Убираем спецсимволы из ключа
-    safe_key = msg_key.replace('/', '_').replace(':', '_')
-    path = f"{PROCESSED_MSG_DIR}/{safe_key}.done"
+    if not redis_client:
+        return False
 
-    try:
-        # O_CREAT | O_EXCL — атомарно создаёт файл
-        # Если файл уже есть — бросает FileExistsError
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(time.time()).encode())
-        os.close(fd)
+    key    = f"msg:{msg_key}"
+    result = redis_client.set(key, "1", nx=True, ex=3600)
+
+    if result:
         print(f"✅ Сообщение {msg_key} — мы первые, обрабатываем")
         return False  # Мы первые
-    except FileExistsError:
-        print(f"⚠️ Сообщение {msg_key} уже обрабатывается другим процессом — пропускаем")
-        return True  # Уже обрабатывается
+    else:
+        print(f"⚠️ Сообщение {msg_key} уже обрабатывается — пропускаем")
+        return True   # Уже занято
 
-def cleanup_old_msg_files():
-    """Чистим старые файлы сообщений (старше 1 часа)"""
-    try:
-        now = time.time()
-        for fname in os.listdir(PROCESSED_MSG_DIR):
-            fpath = os.path.join(PROCESSED_MSG_DIR, fname)
-            if os.path.getmtime(fpath) < now - 3600:
-                os.remove(fpath)
-    except Exception as e:
-        print(f"⚠️ Ошибка чистки файлов: {e}")
 
-# ============================================
-# ФАЙЛОВЫЕ ЛОКИ ДЛЯ ТЕЛЕФОНОВ
-# ============================================
-
-def process_with_phone_lock(phone_clean, callback):
+def is_phone_processing(phone_clean):
     """
-    Атомарно обрабатывает телефон через файловый лок.
-    Работает между разными процессами.
-    callback — функция которая проверяет дубль и создаёт лид.
+    Атомарно резервирует телефон через Redis.
+    SET NX — если ключа нет — создаём и возвращаем False (мы первые).
+    Если ключ есть — возвращаем True (дубль).
+    TTL 5 минут.
     """
-    lock_path = f"{PHONE_LOCK_DIR}/{phone_clean}.lock"
-    done_path = f"{PHONE_LOCK_DIR}/{phone_clean}.done"
+    if not redis_client:
+        return False
 
-    # Быстрая проверка — уже создан?
-    if os.path.exists(done_path):
-        # Проверяем что файл свежий (не старше 24 часов)
-        if time.time() - os.path.getmtime(done_path) < 86400:
-            print(f"⛔ Телефон {phone_clean} уже создан (done-файл)")
-            return None, "duplicate"
-        else:
-            # Файл старый — удаляем, разрешаем создание
-            os.remove(done_path)
+    key    = f"phone:{phone_clean}"
+    result = redis_client.set(key, "1", nx=True, ex=300)
 
-    lock_file = open(lock_path, 'w')
-    try:
-        # Эксклюзивный лок — второй процесс ждёт здесь
-        print(f"🔒 Получаем лок для: {phone_clean}")
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        print(f"✅ Лок получен для: {phone_clean}")
+    if result:
+        print(f"✅ Телефон {phone_clean} зарезервирован в Redis")
+        return False  # Мы первые
+    else:
+        print(f"⛔ Телефон {phone_clean} уже обрабатывается в другом процессе!")
+        return True   # Уже занят
 
-        # Повторная проверка после получения лока
-        # (пока мы ждали — первый процесс мог уже создать)
-        if os.path.exists(done_path):
-            if time.time() - os.path.getmtime(done_path) < 86400:
-                print(f"⛔ Телефон {phone_clean} создан пока мы ждали лок")
-                return None, "duplicate"
 
-        # Выполняем callback (проверка дублей + создание в Битрикс)
-        result_id, status = callback()
+def release_phone(phone_clean):
+    """Освобождаем телефон из Redis после ошибки"""
+    if not redis_client:
+        return
+    key = f"phone:{phone_clean}"
+    redis_client.delete(key)
+    print(f"🔓 Телефон {phone_clean} освобождён в Redis")
 
-        # Если успешно — создаём done-файл
-        if status == "ok":
-            with open(done_path, 'w') as f:
-                f.write(str(time.time()))
-            print(f"✅ Done-файл создан для: {phone_clean}")
 
-        return result_id, status
+def mark_phone_done(phone_clean):
+    """Помечаем телефон как созданный на 24 часа"""
+    if not redis_client:
+        return
+    key = f"phone_done:{phone_clean}"
+    redis_client.set(key, "1", ex=86400)
+    print(f"✅ Телефон {phone_clean} помечен как созданный в Redis")
 
-    finally:
-        fcntl.flock(lock_file, fcntl.LOCK_UN)
-        lock_file.close()
-        print(f"🔓 Лок снят для: {phone_clean}")
+
+def is_phone_done(phone_clean):
+    """Проверяем был ли телефон уже создан"""
+    if not redis_client:
+        return False
+    key = f"phone_done:{phone_clean}"
+    return redis_client.exists(key) > 0
 
 # ============================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -172,6 +156,7 @@ def get_source_from_chat(chat_title):
         if keyword.lower() in chat_lower:
             return source_name
     return f'Telegram: {chat_title}'
+
 
 def get_type_id(category_name):
     if not category_name:
@@ -202,7 +187,6 @@ def check_duplicate_in_bitrix(phone_clean):
             timeout=10
         )
         lead_data = lead_resp.json()
-        print(f"📋 Лиды ответ: {lead_data}")
         if lead_data.get('result'):
             print(f"⛔ Дубль в ЛИДАХ: {lead_data['result']}")
             return True
@@ -216,7 +200,6 @@ def check_duplicate_in_bitrix(phone_clean):
             timeout=10
         )
         contact_data = contact_resp.json()
-        print(f"📋 Контакты ответ: {contact_data}")
         if contact_data.get('result'):
             print(f"⛔ Дубль в КОНТАКТАХ: {contact_data['result']}")
             return True
@@ -371,10 +354,22 @@ def send_to_bitrix(data, source_name, chat_title):
         print(f"⚠️ Некорректный телефон: {phone}")
         return None, "no_phone", category
 
-    def do_create():
-        # Проверка дублей в Битрикс
+    # ✅ ШАГ 1: Проверяем был ли телефон уже создан ранее
+    if is_phone_done(phone_clean):
+        print(f"⛔ Телефон {phone_clean} уже был создан ранее (Redis done)")
+        return None, "duplicate", category
+
+    # ✅ ШАГ 2: Атомарно резервируем телефон в Redis
+    # Если два процесса пришли одновременно — только один пройдёт дальше
+    if is_phone_processing(phone_clean):
+        print(f"⛔ Телефон {phone_clean} уже обрабатывается параллельно")
+        return None, "duplicate", category
+
+    try:
+        # ✅ ШАГ 3: Проверяем дубль в Битрикс
         if check_duplicate_in_bitrix(phone_clean):
-            return None, "duplicate"
+            mark_phone_done(phone_clean)
+            return None, "duplicate", category
 
         type_id = get_type_id(category)
 
@@ -393,6 +388,7 @@ def send_to_bitrix(data, source_name, chat_title):
         title = f"Ремонт | {name} | {address[:50]}"
 
         # Создаём контакт
+        contact_id = None
         try:
             contact_resp = requests.post(
                 BITRIX_URL + "crm.contact.add.json",
@@ -411,9 +407,9 @@ def send_to_bitrix(data, source_name, chat_title):
             print(f"Контакт создан ID: {contact_id}")
         except Exception as e:
             print(f"❌ Ошибка создания контакта: {e}")
-            contact_id = None
 
         # Создаём лид
+        lead_id = None
         try:
             lead_fields = {
                 "TITLE":              title,
@@ -437,9 +433,9 @@ def send_to_bitrix(data, source_name, chat_title):
             print(f"Лид создан ID: {lead_id}")
         except Exception as e:
             print(f"❌ Ошибка создания лида: {e}")
-            lead_id = None
 
         # Создаём сделку
+        deal_id = None
         try:
             deal_fields = {
                 "TITLE":                title,
@@ -465,22 +461,28 @@ def send_to_bitrix(data, source_name, chat_title):
             print(f"Сделка создана ID: {deal_id}")
         except Exception as e:
             print(f"❌ Ошибка создания сделки: {e}")
-            deal_id = None
 
         if lead_id or deal_id:
-            return lead_id or deal_id, "ok"
+            # ✅ ШАГ 4: Помечаем телефон как созданный на 24 часа
+            mark_phone_done(phone_clean)
+            return lead_id or deal_id, "ok", category
 
-        return None, "bitrix_error"
+        # Если ничего не создалось — освобождаем телефон
+        release_phone(phone_clean)
+        return None, "bitrix_error", category
 
-    # Запускаем с файловым локом на телефон
-    result_id, status = process_with_phone_lock(phone_clean, do_create)
-    return result_id, status, category
+    except Exception as e:
+        print(f"❌ Общая ошибка send_to_bitrix: {e}")
+        # При ошибке освобождаем телефон чтобы можно было повторить
+        release_phone(phone_clean)
+        return None, "bitrix_error", category
 
 # ============================================
 # БОТ
 # ============================================
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
+
 
 def set_reaction(chat_id, message_id, emoji="👍"):
     try:
@@ -502,9 +504,11 @@ def set_reaction(chat_id, message_id, emoji="👍"):
     except Exception as e:
         print(f"❌ Ошибка реакции: {e}")
 
+
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     bot.reply_to(message, "✅ Бот активен.")
+
 
 @bot.message_handler(commands=['test'])
 def cmd_test(message):
@@ -517,10 +521,11 @@ def cmd_test(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Нет связи: {e}")
 
+
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
 
-    # ✅ Файловая проверка — работает между процессами
+    # ✅ Redis проверка сообщения — работает между процессами
     msg_key = f"{message.chat.id}_{message.message_id}"
     if is_message_processed(msg_key):
         return
@@ -541,7 +546,6 @@ def handle_message(message):
     source_name = get_source_from_chat(chat_title)
 
     print(f"\n{'='*50}")
-    print(f"АДРЕС: {chat_title}")
     print(f"📨 Заявка из чата: '{chat_title}'")
     print(f"📢 Источник: {source_name}")
     print(f"📝 Текст: {text[:300]}")
@@ -573,16 +577,13 @@ def handle_message(message):
         else:
             print(f"❌ Ошибка для: {name} | {phone}")
 
-    # Чистим старые файлы раз в 100 сообщений
-    if hash(msg_key) % 100 == 0:
-        cleanup_old_msg_files()
-
     if success_count > 0:
         set_reaction(message.chat.id, message.message_id, "✅")
     elif duplicate_count > 0:
         set_reaction(message.chat.id, message.message_id, "❌")
     elif skip_count > 0:
         set_reaction(message.chat.id, message.message_id, "🤔")
+
 
 # ============================================
 # ЗАПУСК
