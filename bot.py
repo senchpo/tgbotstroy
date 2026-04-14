@@ -3,6 +3,7 @@ import requests
 import time
 import os
 import re
+import uuid
 
 # ============================================
 # КОНФИГ
@@ -61,15 +62,15 @@ KEYWORDS = [
     'столешница', 'витрина', 'помещение', 'магазин',
 ]
 
+# ✅ Кэш обработанных сообщений и телефонов
+processed_messages = set()
+processed_phones   = set()
+
 # ============================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================
 
 def normalize_phone(phone: str) -> str:
-    """
-    Возвращает номер в формате +7XXXXXXXXXX
-    Вход: любой формат — 89031234567 / +79031234567 / 79031234567
-    """
     digits = re.sub(r'\D', '', phone)
     if len(digits) == 11 and digits.startswith('8'):
         digits = '7' + digits[1:]
@@ -105,14 +106,10 @@ def get_type_id(category_name):
 # ============================================
 
 def check_duplicate_in_bitrix(phone_normalized: str) -> bool:
-    """
-    phone_normalized — формат +7XXXXXXXXXX
-    Возвращает True если дубль найден
-    """
     try:
         print(f"🔍 Проверяем дубль для: {phone_normalized}")
 
-        # Метод 1: crm.duplicate.findbycomm (самый точный)
+        # Метод 1: crm.duplicate.findbycomm
         resp = requests.get(
             BITRIX_URL + "crm.duplicate.findbycomm.json",
             params={
@@ -131,11 +128,11 @@ def check_duplicate_in_bitrix(phone_normalized: str) -> bool:
             result.get('LEAD') or
             result.get('DEAL')
         ):
-            print(f"⛔ Дубль найден: {result}")
+            print(f"⛔ Дубль найден (findbycomm): {result}")
             return True
 
         # Метод 2: поиск по контактам
-        c_resp = requests.post(
+        c_resp   = requests.post(
             BITRIX_URL + "crm.contact.list.json",
             json={
                 "filter": {"PHONE": phone_normalized},
@@ -150,7 +147,7 @@ def check_duplicate_in_bitrix(phone_normalized: str) -> bool:
             return True
 
         # Метод 3: поиск по лидам
-        l_resp = requests.post(
+        l_resp   = requests.post(
             BITRIX_URL + "crm.lead.list.json",
             json={
                 "filter": {"PHONE": phone_normalized},
@@ -164,12 +161,27 @@ def check_duplicate_in_bitrix(phone_normalized: str) -> bool:
             print(f"⛔ Дубль в лидах: {l_result}")
             return True
 
+        # Метод 4: поиск по сделкам
+        d_resp   = requests.post(
+            BITRIX_URL + "crm.deal.list.json",
+            json={
+                "filter": {"PHONE": phone_normalized},
+                "select": ["ID", "TITLE"],
+            },
+            timeout=10
+        )
+        d_result = d_resp.json().get('result', [])
+        print(f"  deal.list: {d_result}")
+        if d_result:
+            print(f"⛔ Дубль в сделках: {d_result}")
+            return True
+
         print(f"✅ Дублей нет для: {phone_normalized}")
         return False
 
     except Exception as e:
         print(f"❌ Ошибка проверки дублей: {e}")
-        return True  # Безопаснее не создавать при ошибке
+        return True
 
 # ============================================
 # AI ПАРСИНГ
@@ -282,8 +294,19 @@ def parse_lead_ai(text):
         if current_lead and current_lead.get('phone') and current_lead['phone'] != 'Не указано':
             leads.append(current_lead)
 
-        print(f"Найдено лидов: {len(leads)}")
-        return leads
+        # ✅ Совет Анны — убираем дубли по телефону внутри одного AI ответа
+        seen_phones  = set()
+        unique_leads = []
+        for lead in leads:
+            p = normalize_phone(lead.get('phone', ''))
+            if p and p not in seen_phones:
+                seen_phones.add(p)
+                unique_leads.append(lead)
+            else:
+                print(f"⚠️ Дубль телефона в AI ответе пропущен: {p}")
+
+        print(f"Найдено лидов: {len(unique_leads)}")
+        return unique_leads
 
     except Exception as e:
         print(f"❌ AI ошибка: {e}")
@@ -306,7 +329,6 @@ def send_to_bitrix(data, source_name, chat_title):
     if not phone or phone == 'Не указано':
         return None, "no_phone", category
 
-    # ✅ Единая нормализация телефона
     phone_normalized = normalize_phone(phone)
     digits_only      = re.sub(r'\D', '', phone_normalized)
 
@@ -314,9 +336,23 @@ def send_to_bitrix(data, source_name, chat_title):
         print(f"⚠️ Некорректный телефон: {phone} → {phone_normalized}")
         return None, "no_phone", category
 
-    # ✅ Проверка дублей
+    # ✅ Проверка локального кэша телефонов
+    if phone_normalized in processed_phones:
+        print(f"⚠️ Телефон уже обрабатывается в этой сессии: {phone_normalized}")
+        return None, "duplicate", category
+
+    # ✅ Проверка дублей в Битриксе
     if check_duplicate_in_bitrix(phone_normalized):
         return None, "duplicate", category
+
+    # ✅ Добавляем в локальный кэш СРАЗУ после проверки
+    processed_phones.add(phone_normalized)
+    if len(processed_phones) > 500:
+        processed_phones.clear()
+
+    # ✅ Совет Анны №3 — уникальный ID заявки
+    request_uid = str(uuid.uuid4())
+    print(f"🆔 UID заявки: {request_uid}")
 
     type_id = get_type_id(category)
 
@@ -362,13 +398,14 @@ def send_to_bitrix(data, source_name, chat_title):
     lead_id = None
     try:
         lead_fields = {
-            "TITLE":              title,
-            "NAME":               name,
-            "PHONE":              [{"VALUE": phone_normalized, "VALUE_TYPE": "WORK"}],
-            "ADDRESS":            address,
-            "COMMENTS":           comments,
-            "SOURCE_ID":          "UC_CRM_SOURCE",
-            "SOURCE_DESCRIPTION": source_name,
+            "TITLE":                title,
+            "NAME":                 name,
+            "PHONE":                [{"VALUE": phone_normalized, "VALUE_TYPE": "WORK"}],
+            "ADDRESS":              address,
+            "COMMENTS":             comments,
+            "SOURCE_ID":            "UC_CRM_SOURCE",
+            "SOURCE_DESCRIPTION":   source_name,
+            "UF_CRM_REQUEST_UID":   request_uid,  # ✅ уникальный ID
         }
         if contact_id:
             lead_fields["CONTACT_ID"] = contact_id
@@ -396,6 +433,7 @@ def send_to_bitrix(data, source_name, chat_title):
             "SOURCE_ID":            "UC_CRM_SOURCE",
             "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
+            "UF_CRM_REQUEST_UID":   request_uid,  # ✅ уникальный ID
         }
         if type_id:
             deal_fields["TYPE_ID"] = type_id
@@ -470,6 +508,16 @@ def cmd_test(message):
 
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
+
+    # ✅ ЗАЩИТА ОТ ДВОЙНОЙ ОБРАБОТКИ — самая первая проверка
+    msg_key = f"{message.chat.id}_{message.message_id}"
+    if msg_key in processed_messages:
+        print(f"⚠️ Сообщение уже обработано, пропускаем: {msg_key}")
+        return
+    processed_messages.add(msg_key)
+    if len(processed_messages) > 1000:
+        processed_messages.clear()
+
     text = message.text
     if not text or text.startswith('/') or len(text) < 10:
         return
