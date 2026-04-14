@@ -159,67 +159,40 @@ def check_duplicate_in_bitrix(phone_normalized: str) -> bool:
     try:
         print(f"🔍 Проверяем дубль для: {phone_normalized}")
 
-        resp = requests.get(
-            BITRIX_URL + "crm.duplicate.findbycomm.json",
-            params={
-                "type":        "PHONE",
-                "values[]":    phone_normalized,
-                "entity_type": "CONTACT",
-            },
-            timeout=10
-        )
-        data   = resp.json()
-        result = data.get('result', {})
-        print(f"  findbycomm: {result}")
-
-        if isinstance(result, dict) and (
-            result.get('CONTACT') or
-            result.get('LEAD') or
-            result.get('DEAL')
-        ):
-            print(f"⛔ Дубль найден (findbycomm): {result}")
-            return True
-
-        c_resp   = requests.post(
+        # ✅ Главная проверка — по контактам (телефон прямое поле)
+        c_resp = requests.post(
             BITRIX_URL + "crm.contact.list.json",
             json={
                 "filter": {"PHONE": phone_normalized},
-                "select": ["ID", "NAME"],
+                "select": ["ID", "NAME", "PHONE"],
             },
             timeout=10
         )
         c_result = c_resp.json().get('result', [])
         print(f"  contact.list: {c_result}")
+
         if c_result:
-            print(f"⛔ Дубль в контактах: {c_result}")
+            # Показываем кто найден
+            for contact in c_result:
+                print(f"⛔ Найден контакт: ID={contact.get('ID')} | {contact.get('NAME')}")
             return True
 
-        l_resp   = requests.post(
+        # ✅ Резервная проверка — по лидам
+        # (лиды тоже хранят телефон напрямую)
+        l_resp = requests.post(
             BITRIX_URL + "crm.lead.list.json",
             json={
                 "filter": {"PHONE": phone_normalized},
-                "select": ["ID", "NAME"],
+                "select": ["ID", "NAME", "PHONE"],
             },
             timeout=10
         )
         l_result = l_resp.json().get('result', [])
         print(f"  lead.list: {l_result}")
-        if l_result:
-            print(f"⛔ Дубль в лидах: {l_result}")
-            return True
 
-        d_resp   = requests.post(
-            BITRIX_URL + "crm.deal.list.json",
-            json={
-                "filter": {"PHONE": phone_normalized},
-                "select": ["ID", "TITLE"],
-            },
-            timeout=10
-        )
-        d_result = d_resp.json().get('result', [])
-        print(f"  deal.list: {d_result}")
-        if d_result:
-            print(f"⛔ Дубль в сделках: {d_result}")
+        if l_result:
+            for lead in l_result:
+                print(f"⛔ Найден лид: ID={lead.get('ID')} | {lead.get('NAME')}")
             return True
 
         print(f"✅ Дублей нет для: {phone_normalized}")
@@ -227,7 +200,8 @@ def check_duplicate_in_bitrix(phone_normalized: str) -> bool:
 
     except Exception as e:
         print(f"❌ Ошибка проверки дублей: {e}")
-        return True
+        return False  # при сбое сети — не блокируем лида
+
 
 # ============================================
 # AI ПАРСИНГ
