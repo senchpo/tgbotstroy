@@ -367,24 +367,21 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         print(f"⚠️ Некорректный телефон: {phone} → {phone_norm}")
         return None, "no_phone", category
 
-    # ШАГ 1: Захватываем блокировку
     if not acquire_lock(phone_norm):
         return None, "duplicate", category
 
     try:
         time.sleep(0.3)
 
-        # ШАГ 2: Проверка дублей — если есть, ПРОСТО ПРОПУСКАЕМ
         if check_duplicate(phone_norm):
             return None, "duplicate", category
 
-        # ШАГ 3: Помечаем ДО создания (защита от параллельных запросов)
         mark_phone_known(phone_norm)
 
         type_id = get_type_id(category)
         title   = f"Ремонт | {name} | {address[:40]}"
 
-        # Комментарий: структурированные данные + оригинальный текст из чата
+        # Комментарий для контакта и лида
         comments = (
             f"📢 Источник: {source_name}\n"
             f"💬 Чат: {chat_title}\n"
@@ -392,7 +389,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             f"📐 Объём: {volume}\n"
             f"📅 Срок: {deadline}\n"
             f"🏷️ Тип: {category}\n"
-            f"💬 Комментарий: {comment}\n"
+            f"💬 Доп. инфо: {comment}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📩 Оригинал из чата:\n{raw_text}"
         )
@@ -405,7 +402,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             "SOURCE_ID":          source_id,
             "SOURCE_DESCRIPTION": source_name,
             "COMMENTS":           comments,
-            "ASSIGNED_BY_ID":     0,
         }})
         contact_id = cr.get('result') if isinstance(cr, dict) else None
         print(f"{'✅' if contact_id else '⚠️'} Контакт: {contact_id or cr}")
@@ -419,7 +415,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             "COMMENTS":           comments,
             "SOURCE_ID":          source_id,
             "SOURCE_DESCRIPTION": source_name,
-            "ASSIGNED_BY_ID":     0,
         }
         if contact_id:
             lead_fields["CONTACT_ID"] = contact_id
@@ -429,13 +424,25 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         print(f"{'✅' if lead_id else '⚠️'} Лид: {lead_id or lr}")
 
         # ── СДЕЛКА ───────────────────────────────────
+        # ✅ COMMENT (без S) + raw_text прямо внутри
+        deal_comment = (
+            f"📢 Источник: {source_name}\n"
+            f"💬 Чат: {chat_title}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📐 Объём: {volume}\n"
+            f"📅 Срок: {deadline}\n"
+            f"🏷️ Тип: {category}\n"
+            f"💬 Доп. инфо: {comment}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📩 Оригинал из чата:\n{raw_text}"
+        )
+
         deal_fields = {
             "TITLE":                title,
-            "COMMENTS":             comments,
+            "COMMENT":              deal_comment,
             "SOURCE_ID":            source_id,
             "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
-            "ASSIGNED_BY_ID":       0,
         }
         if type_id:
             deal_fields["TYPE_ID"] = type_id
@@ -459,7 +466,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
 
     finally:
         release_lock(phone_norm)
-
 
 # ============================================
 # БОТ
