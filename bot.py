@@ -491,6 +491,18 @@ def set_reaction(chat_id, message_id, emoji="✅"):
         print(f"❌ Реакция: {e}")
 
 
+@bot.message_handler(commands=['sources'])
+def cmd_sources(msg):
+    r = bitrix_post("crm.status.list", {
+        "filter": {"ENTITY_ID": "SOURCE"}
+    })
+    items = r.get("result", [])
+    text = "📋 Источники в Битрикс:\n\n"
+    for item in items:
+        text += f"ID: `{item['STATUS_ID']}` → {item['NAME']}\n"
+    bot.reply_to(msg, text)
+
+
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(msg):
     bot.reply_to(msg, "✅ Бот активен.")
