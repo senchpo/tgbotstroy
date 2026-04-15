@@ -409,6 +409,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         deal_fields = {
             "TITLE":                title,
             "COMMENT":              comments,
+            "ADDITIONAL_INFO":      raw_text,
             "SOURCE_ID":            source_id,
             "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
