@@ -381,7 +381,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         type_id = get_type_id(category)
         title   = f"Ремонт | {name} | {address[:40]}"
 
-        # Комментарий для контакта и лида
         comments = (
             f"📢 Источник: {source_name}\n"
             f"💬 Чат: {chat_title}\n"
@@ -406,40 +405,10 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         contact_id = cr.get('result') if isinstance(cr, dict) else None
         print(f"{'✅' if contact_id else '⚠️'} Контакт: {contact_id or cr}")
 
-        # ── ЛИД ──────────────────────────────────────
-        lead_fields = {
-            "TITLE":              title,
-            "NAME":               name,
-            "PHONE":              [{"VALUE": phone_norm, "VALUE_TYPE": "WORK"}],
-            "ADDRESS":            address,
-            "COMMENTS":           comments,
-            "SOURCE_ID":          source_id,
-            "SOURCE_DESCRIPTION": source_name,
-        }
-        if contact_id:
-            lead_fields["CONTACT_ID"] = contact_id
-
-        lr      = bitrix_post("crm.lead.add", {"fields": lead_fields})
-        lead_id = lr.get('result') if isinstance(lr, dict) else None
-        print(f"{'✅' if lead_id else '⚠️'} Лид: {lead_id or lr}")
-
         # ── СДЕЛКА ───────────────────────────────────
-        # ✅ COMMENT (без S) + raw_text прямо внутри
-        deal_comment = (
-            f"📢 Источник: {source_name}\n"
-            f"💬 Чат: {chat_title}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📐 Объём: {volume}\n"
-            f"📅 Срок: {deadline}\n"
-            f"🏷️ Тип: {category}\n"
-            f"💬 Доп. инфо: {comment}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📩 Оригинал из чата:\n{raw_text}"
-        )
-
         deal_fields = {
             "TITLE":                title,
-            "COMMENT":              deal_comment,
+            "COMMENT":              comments,
             "SOURCE_ID":            source_id,
             "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
@@ -448,15 +417,13 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             deal_fields["TYPE_ID"] = type_id
         if contact_id:
             deal_fields["CONTACT_IDS"] = [contact_id]
-        if lead_id:
-            deal_fields["LEAD_ID"] = lead_id
 
         dr      = bitrix_post("crm.deal.add", {"fields": deal_fields})
         deal_id = dr.get('result') if isinstance(dr, dict) else None
         print(f"{'✅' if deal_id else '⚠️'} Сделка: {deal_id or dr}")
 
-        if lead_id or deal_id:
-            return lead_id or deal_id, "ok", category
+        if deal_id:
+            return deal_id, "ok", category
 
         return None, "bitrix_error", category
 
