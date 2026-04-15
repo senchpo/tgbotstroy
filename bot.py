@@ -10,23 +10,23 @@ from datetime import datetime, timedelta
 # КОНФИГ
 # ============================================
 TOKEN        = os.environ.get("TOKEN", "")
-BITRIX_URL   = os.environ.get("BITRIX_URL", "")  # https://xxx.bitrix24.ru/rest/1/TOKEN/
+BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 # ============================================
-# ПОТОКОБЕЗОПАСНЫЕ БЛОКИРОВКИ ПО ТЕЛЕФОНУ
+# БЛОКИРОВКИ ПО ТЕЛЕФОНУ
 # ============================================
 _phone_locks: dict[str, datetime] = {}
 _locks_mutex = threading.Lock()
-LOCK_TTL = 60  # секунд
+LOCK_TTL = 60
 
 
 def acquire_lock(phone: str) -> bool:
     with _locks_mutex:
         now = datetime.now()
-        # Чистим устаревшие
-        for p in [p for p, t in _phone_locks.items()
-                  if (now - t).seconds > LOCK_TTL]:
+        expired = [p for p, t in _phone_locks.items()
+                   if (now - t).total_seconds() > LOCK_TTL]
+        for p in expired:
             del _phone_locks[p]
 
         if phone in _phone_locks:
@@ -46,13 +46,13 @@ def release_lock(phone: str):
 
 
 # ============================================
-# ЛОКАЛЬНЫЙ КЭШ ТЕЛЕФОНОВ (быстрая защита)
+# ЛОКАЛЬНЫЙ КЭШ ТЕЛЕФОНОВ
 # ============================================
 _known_phones: set[str] = set()
 _known_phones_mutex = threading.Lock()
 
 
-def is_phone_known_locally(phone: str) -> bool:
+def is_phone_known(phone: str) -> bool:
     with _known_phones_mutex:
         return phone in _known_phones
 
@@ -60,7 +60,7 @@ def is_phone_known_locally(phone: str) -> bool:
 def mark_phone_known(phone: str):
     with _known_phones_mutex:
         _known_phones.add(phone)
-        print(f"📝 Телефон добавлен в локальный кэш: {phone}")
+        print(f"📝 Добавлен в кэш: {phone}")
 
 
 # ============================================
@@ -109,7 +109,6 @@ KEYWORDS = [
     'столешница', 'витрина', 'помещение', 'магазин',
 ]
 
-# Кэш обработанных сообщений
 _processed_msgs: set[str] = set()
 _processed_msgs_mutex = threading.Lock()
 
@@ -150,81 +149,93 @@ def get_type_id(category: str) -> str | None:
 
 
 def bitrix_post(method: str, payload: dict) -> dict:
-    """Универсальный POST в Битрикс с логированием"""
+    """
+    Универсальный POST в Битрикс.
+    ВСЕГДА возвращает dict — никогда не падает.
+    """
     url = BITRIX_URL + method
     try:
         resp = requests.post(url, json=payload, timeout=15)
         data = resp.json()
+
+        # ✅ ГЛАВНЫЙ ФИX: Битрикс иногда возвращает [] вместо {}
+        if isinstance(data, list):
+            print(f"⚠️ [{method}] вернул список вместо словаря: {data}")
+            return {"result": data}
+
+        if not isinstance(data, dict):
+            print(f"⚠️ [{method}] неожиданный тип ответа: {type(data)} = {data}")
+            return {}
+
         if 'error' in data:
-            print(f"⚠️ Битрикс ошибка [{method}]: {data['error']} — {data.get('error_description')}")
+            print(f"⚠️ Битрикс ошибка [{method}]: "
+                  f"{data['error']} — {data.get('error_description', '')}")
+
         return data
+
     except Exception as e:
         print(f"❌ Ошибка запроса [{method}]: {e}")
         return {}
 
 
 # ============================================
-# ПРОВЕРКА ДУБЛЕЙ — ГЛАВНАЯ ФУНКЦИЯ
+# ПРОВЕРКА ДУБЛЕЙ
 # ============================================
-def check_duplicate(phone: str) -> bool:
+def check_duplicate(phone_norm: str) -> bool:
     """
-    Тройная проверка дублей:
-    1. Локальный кэш (мгновенно)
-    2. crm.duplicate.findByComm — ПРАВИЛЬНЫЙ метод Битрикс
-    3. crm.contact.list — резервная
+    1. Локальный кэш
+    2. findByComm по CONTACT
+    3. findByComm по LEAD
     """
 
-    # 1️⃣ Локальный кэш
-    if is_phone_known_locally(phone):
-        print(f"⛔ [КЭШ] Телефон уже известен: {phone}")
+    # 1️⃣ Локальный кэш — мгновенно
+    if is_phone_known(phone_norm):
+        print(f"⛔ [КЭШ] Дубль: {phone_norm}")
         return True
 
-    print(f"🔍 Проверяем дубль в Битрикс: {phone}")
+    # Только цифры для Битрикс
+    phone_digits = re.sub(r'\D', '', phone_norm)
+    print(f"🔍 Проверяем дубль: {phone_norm} (digits: {phone_digits})")
 
-    # Убираем + для метода findByComm
-    phone_digits = re.sub(r'\D', '', phone)
-
-    # 2️⃣ crm.duplicate.findByComm — ищем в CONTACT
+    # 2️⃣ findByComm → CONTACT
     resp = bitrix_post("crm.duplicate.findByComm", {
-        "type": "PHONE",
-        "values": [phone_digits],
-        "entity_type": "CONTACT"
+        "type":        "PHONE",
+        "values":      [phone_digits],
+        "entity_type": "CONTACT",
     })
+    # result может быть {} или {"CONTACT": [1,2,3]}
     result = resp.get("result", {})
+
+    # ✅ Защита: result тоже может быть списком
+    if isinstance(result, list):
+        result = {}
+
     print(f"  findByComm CONTACT: {result}")
-    if result.get("CONTACT"):
-        print(f"⛔ Найден дубль контакта: {result['CONTACT']}")
-        mark_phone_known(phone)
+
+    if isinstance(result, dict) and result.get("CONTACT"):
+        print(f"⛔ Дубль контакта: {result['CONTACT']}")
+        mark_phone_known(phone_norm)
         return True
 
-    # 3️⃣ crm.duplicate.findByComm — ищем в LEAD
+    # 3️⃣ findByComm → LEAD
     resp2 = bitrix_post("crm.duplicate.findByComm", {
-        "type": "PHONE",
-        "values": [phone_digits],
-        "entity_type": "LEAD"
+        "type":        "PHONE",
+        "values":      [phone_digits],
+        "entity_type": "LEAD",
     })
     result2 = resp2.get("result", {})
+
+    if isinstance(result2, list):
+        result2 = {}
+
     print(f"  findByComm LEAD: {result2}")
-    if result2.get("LEAD"):
-        print(f"⛔ Найден дубль лида: {result2['LEAD']}")
-        mark_phone_known(phone)
+
+    if isinstance(result2, dict) and result2.get("LEAD"):
+        print(f"⛔ Дубль лида: {result2['LEAD']}")
+        mark_phone_known(phone_norm)
         return True
 
-    # 4️⃣ crm.duplicate.findByComm — ищем в DEAL (через contact)
-    # Дополнительно проверяем сделки через контакт
-    resp3 = bitrix_post("crm.duplicate.findByComm", {
-        "type": "PHONE",
-        "values": [phone_digits],
-        "entity_type": "COMPANY"
-    })
-    result3 = resp3.get("result", {})
-    print(f"  findByComm COMPANY: {result3}")
-    if result3.get("COMPANY"):
-        print(f"⛔ Найден дубль компании: {result3['COMPANY']}")
-        mark_phone_known(phone)
-        return True
-
-    print(f"✅ Дублей нет: {phone}")
+    print(f"✅ Дублей нет: {phone_norm}")
     return False
 
 
@@ -236,12 +247,12 @@ def parse_lead_ai(text: str) -> list[dict]:
         categories_list = "\n".join([f"- {k}" for k in REPAIR_TYPE_MAP.keys()])
 
         payload = {
-            "model": "llama-3.3-70b-versatile",
+            "model":       "llama-3.3-70b-versatile",
             "temperature": 0,
             "messages": [{
                 "role": "user",
                 "content": f"""Ты парсер заявок на ремонт квартир.
-Найди всех клиентов в тексте и верни СТРОГО в формате ниже.
+Найди всех клиентов и верни СТРОГО в формате:
 
 ЛИД 1:
 ИМЯ: ...
@@ -254,28 +265,28 @@ def parse_lead_ai(text: str) -> list[dict]:
 ---
 
 ПРАВИЛА:
-- ТЕЛЕФОН: только в формате +7XXXXXXXXXX
-- Если данных нет — пиши: Не указано
-- Несколько клиентов — ЛИД 1, ЛИД 2 и т.д.
+- ТЕЛЕФОН: формат +7XXXXXXXXXX
+- Если нет данных — пиши: Не указано
+- Несколько клиентов → ЛИД 1, ЛИД 2 и т.д.
 
-КАТЕГОРИЯ — выбери ОДНУ из списка:
+КАТЕГОРИЯ — одна строка из списка:
 {categories_list}
 
-Правила выбора КАТЕГОРИИ:
+Правила КАТЕГОРИИ:
 - санузел/ванна/туалет → сан узла
 - кухня/столешница → кухни
 - комната/зал/спальня → комнаты
 - балкон/лоджия → балкона
 - студия → студия
-- однушка/1-комн/1к → 1-комнатная
-- двушка/2-комн/2к → 2-комнатная
-- трёшка/3-комн/3к/4к+ → 3 и более
+- однушка/1к/1-комн → 1-комнатная
+- двушка/2к/2-комн → 2-комнатная
+- трёшка/3к/3-комн/4к+ → 3 и более
 - дом/коттедж/дача → дома
 - офис/помещение/магазин → офис
-- капитальный/под ключ/черновая/чистовая → Капитальный
+- капитальный/под ключ/черновая/евро → Капитальный
 - косметический/частичный/покраска → Косметический
 
-Текст:
+Текст заявки:
 {text}"""
             }]
         }
@@ -284,7 +295,7 @@ def parse_lead_ai(text: str) -> list[dict]:
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
+                "Content-Type":  "application/json",
             },
             json=payload,
             timeout=30
@@ -298,31 +309,31 @@ def parse_lead_ai(text: str) -> list[dict]:
         ai_text = rj['choices'][0]['message']['content']
         print(f"🤖 AI:\n{ai_text}")
 
-        leads = []
-        cur = {}
+        leads, cur = [], {}
 
         for line in ai_text.split('\n'):
             line = line.strip()
             if not line:
                 continue
+
             if line.startswith('ЛИД'):
                 if cur.get('phone') and cur['phone'] != 'Не указано':
                     leads.append(cur)
                 cur = {'raw_text': text}
             elif line.startswith('ИМЯ:'):
-                cur['name'] = line[4:].strip()
+                cur['name']        = line[4:].strip()
             elif line.startswith('ТЕЛЕФОН:'):
-                cur['phone'] = line[8:].strip()
+                cur['phone']       = line[8:].strip()
             elif line.startswith('АДРЕС:'):
-                cur['address'] = line[6:].strip()
+                cur['address']     = line[6:].strip()
             elif line.startswith('ОБЪЁМ:'):
                 cur['work_volume'] = line[6:].strip()
             elif line.startswith('СРОК:'):
-                cur['deadline'] = line[5:].strip()
+                cur['deadline']    = line[5:].strip()
             elif line.startswith('КАТЕГОРИЯ:'):
-                cur['category'] = line[10:].strip()
+                cur['category']    = line[10:].strip()
             elif line.startswith('КОММЕНТАРИЙ:'):
-                cur['comment'] = line[12:].strip()
+                cur['comment']     = line[12:].strip()
             elif line == '---':
                 if cur.get('phone') and cur['phone'] != 'Не указано':
                     leads.append(cur)
@@ -331,9 +342,8 @@ def parse_lead_ai(text: str) -> list[dict]:
         if cur.get('phone') and cur['phone'] != 'Не указано':
             leads.append(cur)
 
-        # Дедупликация по телефону внутри одного AI-ответа
-        seen = set()
-        unique = []
+        # Дедупликация
+        seen, unique = set(), []
         for lead in leads:
             p = normalize_phone(lead.get('phone', ''))
             if p not in seen:
@@ -365,25 +375,28 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
         return None, "no_phone", category
 
     phone_norm = normalize_phone(phone)
+
     if len(re.sub(r'\D', '', phone_norm)) < 11:
-        print(f"⚠️ Некорректный телефон: {phone}")
+        print(f"⚠️ Некорректный телефон: {phone} → {phone_norm}")
         return None, "no_phone", category
 
-    # ШАГ 1: Блокировка по телефону
+    # ШАГ 1: Захватываем блокировку
     if not acquire_lock(phone_norm):
         return None, "duplicate", category
 
     try:
-        # ШАГ 2: Пауза (защита от гонки потоков)
         time.sleep(0.3)
 
-        # ШАГ 3: Проверка дублей (тройная)
+        # ШАГ 2: Проверка дублей
         if check_duplicate(phone_norm):
             return None, "duplicate", category
 
-        # ШАГ 4: Создаём записи
-        type_id = get_type_id(category)
-        title   = f"Ремонт | {name} | {address[:40]}"
+        # ШАГ 3: Сразу помечаем телефон — до создания записей!
+        # Это защищает от параллельных запросов пока Битрикс создаёт записи
+        mark_phone_known(phone_norm)
+
+        type_id  = get_type_id(category)
+        title    = f"Ремонт | {name} | {address[:40]}"
         comments = (
             f"📢 Источник: {source_name}\n"
             f"💬 Чат: {chat_title}\n"
@@ -406,11 +419,11 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
             "SOURCE_DESCRIPTION": source_name,
             "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
         }})
-        contact_id = cr.get('result')
+        contact_id = cr.get('result') if isinstance(cr, dict) else None
         print(f"{'✅' if contact_id else '⚠️'} Контакт: {contact_id or cr}")
 
         # Лид
-        lead_id = None
+        lead_id     = None
         lead_fields = {
             "TITLE":              title,
             "NAME":               name,
@@ -422,12 +435,13 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
         }
         if contact_id:
             lead_fields["CONTACT_ID"] = contact_id
-        lr = bitrix_post("crm.lead.add", {"fields": lead_fields})
-        lead_id = lr.get('result')
+
+        lr      = bitrix_post("crm.lead.add", {"fields": lead_fields})
+        lead_id = lr.get('result') if isinstance(lr, dict) else None
         print(f"{'✅' if lead_id else '⚠️'} Лид: {lead_id or lr}")
 
         # Сделка
-        deal_id = None
+        deal_id     = None
         deal_fields = {
             "TITLE":                title,
             "COMMENTS":             comments,
@@ -441,20 +455,22 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
             deal_fields["CONTACT_IDS"] = [contact_id]
         if lead_id:
             deal_fields["LEAD_ID"] = lead_id
-        dr = bitrix_post("crm.deal.add", {"fields": deal_fields})
-        deal_id = dr.get('result')
-        print(f"{'✅' if deal_id else '⚠️'} Сделка: {deal_id or dr}")
 
-        # ШАГ 5: Запоминаем телефон в локальный кэш
-        if contact_id or lead_id:
-            mark_phone_known(phone_norm)
+        dr      = bitrix_post("crm.deal.add", {"fields": deal_fields})
+        deal_id = dr.get('result') if isinstance(dr, dict) else None
+        print(f"{'✅' if deal_id else '⚠️'} Сделка: {deal_id or dr}")
 
         if lead_id or deal_id:
             return lead_id or deal_id, "ok", category
 
         return None, "bitrix_error", category
 
+    except Exception as e:
+        print(f"❌ send_to_bitrix exception: {e}")
+        return None, "bitrix_error", category
+
     finally:
+        # Блокировка снимается ВСЕГДА
         release_lock(phone_norm)
 
 
@@ -468,8 +484,9 @@ def set_reaction(chat_id, message_id, emoji="✅"):
     try:
         from telebot import types
         emoji_map = {"✅": "👍", "❌": "👎", "🤔": "🤔"}
-        reaction = types.ReactionTypeEmoji(emoji_map.get(emoji, "👍"))
+        reaction  = types.ReactionTypeEmoji(emoji_map.get(emoji, "👍"))
         bot.set_message_reaction(chat_id, message_id, [reaction], is_big=False)
+        print(f"👍 Реакция поставлена")
     except Exception as e:
         print(f"❌ Реакция: {e}")
 
@@ -482,7 +499,7 @@ def cmd_start(msg):
 @bot.message_handler(commands=['test'])
 def cmd_test(msg):
     r = bitrix_post("crm.lead.list", {"filter": {"ID": "1"}, "select": ["ID"]})
-    if 'result' in r:
+    if isinstance(r, dict) and 'result' in r:
         bot.reply_to(msg, "✅ Битрикс доступен!")
     else:
         bot.reply_to(msg, f"❌ Ошибка: {r}")
@@ -490,21 +507,18 @@ def cmd_test(msg):
 
 @bot.message_handler(commands=['cache'])
 def cmd_cache(msg):
-    """Показать содержимое локального кэша телефонов"""
     with _known_phones_mutex:
-        phones = list(_known_phones)
-    if phones:
-        bot.reply_to(msg, f"📋 В кэше {len(phones)} телефонов:\n" + "\n".join(phones[-20:]))
-    else:
-        bot.reply_to(msg, "📋 Кэш пуст")
+        phones = sorted(_known_phones)
+    text = f"📋 Кэш ({len(phones)}):\n" + "\n".join(phones[-20:]) if phones else "📋 Кэш пуст"
+    bot.reply_to(msg, text)
 
 
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
-    # Защита от двойной обработки
     msg_key = f"{message.chat.id}_{message.message_id}"
     with _processed_msgs_mutex:
         if msg_key in _processed_msgs:
+            print(f"⚠️ Уже обработано: {msg_key}")
             return
         _processed_msgs.add(msg_key)
         if len(_processed_msgs) > 2000:
@@ -515,7 +529,6 @@ def handle_message(message):
         return
     if getattr(message.from_user, 'is_bot', False):
         return
-
     if not any(kw in text.lower() for kw in KEYWORDS):
         return
 
@@ -546,6 +559,8 @@ def handle_message(message):
         elif status == "no_phone":
             skip += 1
             print(f"⚠️ Нет телефона: {n}")
+        else:
+            print(f"❌ Ошибка: {n} | {p}")
 
     if ok:
         set_reaction(message.chat.id, message.message_id, "✅")
@@ -562,15 +577,21 @@ if __name__ == "__main__":
     print("✅ Бот стартует...")
     try:
         bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Вебхук удалён")
     except Exception as e:
         print(f"⚠️ Вебхук: {e}")
+
     time.sleep(3)
     print("🚀 Polling!")
 
     while True:
         try:
-            bot.polling(none_stop=True, interval=2, timeout=30,
-                        allowed_updates=["message"])
+            bot.polling(
+                none_stop=True,
+                interval=2,
+                timeout=30,
+                allowed_updates=["message"]
+            )
         except Exception as e:
             print(f"❌ Polling: {e}")
             time.sleep(30 if "409" in str(e) else 10)
