@@ -4,7 +4,7 @@ import time
 import os
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ============================================
 # КОНФИГ
@@ -64,17 +64,17 @@ def mark_phone_known(phone: str):
 
 
 # ============================================
-# КАРТЫ
+# КАРТЫ ИСТОЧНИКОВ (правильные SOURCE_ID из Битрикс)
 # ============================================
 CHAT_SOURCE_MAP = {
-    'авито':        'Реклама Авито',
-    'прогмат':      'Прогматремонт(Тимур)',
-    'планремонт':   'Планремонта(Денис)',
-    'ремонкаждому': 'РемонКаждому(Марина)',
-    'каждому':      'РемонКаждому(Марина)',
-    'партнерка':    'РемонКаждому(Марина)',
-    'реклама':      'Реклама(Владимир)',
-    'рбт':          'РБТ(Сергей)',
+    'авито':        ('REPEAT_SALE', 'Реклама Авито'),
+    'прогмат':      ('STORE',       'Прогматремонт(Тимур)'),
+    'планремонт':   ('BOOKING',     'Планремонта(Денис)'),
+    'ремонкаждому': ('CALL',        'РемонКаждому(Марина)'),
+    'каждому':      ('CALL',        'РемонКаждому(Марина)'),
+    'партнерка':    ('CALL',        'РемонКаждому(Марина)'),
+    'реклама':      ('WEBFORM',     'Реклама(Владимир)'),
+    'рбт':          ('CALLBACK',    'РБТ(Сергей)'),
 }
 
 REPAIR_TYPE_MAP = {
@@ -125,14 +125,15 @@ def normalize_phone(phone: str) -> str:
     return '+' + digits if digits.startswith('7') else digits
 
 
-def get_source_from_chat(chat_title: str) -> str:
+def get_source_from_chat(chat_title: str) -> tuple[str, str]:
+    """Возвращает (SOURCE_ID, название) для чата"""
     if not chat_title:
-        return 'Telegram'
+        return 'OTHER', 'Telegram'
     chat_lower = chat_title.lower().replace(' ', '')
-    for kw, src in CHAT_SOURCE_MAP.items():
+    for kw, (src_id, src_name) in CHAT_SOURCE_MAP.items():
         if kw.lower() in chat_lower:
-            return src
-    return f'Telegram: {chat_title}'
+            return src_id, src_name
+    return 'OTHER', f'Telegram: {chat_title}'
 
 
 def get_type_id(category: str) -> str | None:
@@ -149,22 +150,18 @@ def get_type_id(category: str) -> str | None:
 
 
 def bitrix_post(method: str, payload: dict) -> dict:
-    """
-    Универсальный POST в Битрикс.
-    ВСЕГДА возвращает dict — никогда не падает.
-    """
+    """Универсальный POST в Битрикс. ВСЕГДА возвращает dict."""
     url = BITRIX_URL + method
     try:
         resp = requests.post(url, json=payload, timeout=15)
         data = resp.json()
 
-        # ✅ ГЛАВНЫЙ ФИX: Битрикс иногда возвращает [] вместо {}
         if isinstance(data, list):
-            print(f"⚠️ [{method}] вернул список вместо словаря: {data}")
+            print(f"⚠️ [{method}] вернул список: {data}")
             return {"result": data}
 
         if not isinstance(data, dict):
-            print(f"⚠️ [{method}] неожиданный тип ответа: {type(data)} = {data}")
+            print(f"⚠️ [{method}] неожиданный тип: {type(data)} = {data}")
             return {}
 
         if 'error' in data:
@@ -187,13 +184,11 @@ def check_duplicate(phone_norm: str) -> bool:
     2. findByComm по CONTACT
     3. findByComm по LEAD
     """
-
     # 1️⃣ Локальный кэш — мгновенно
     if is_phone_known(phone_norm):
         print(f"⛔ [КЭШ] Дубль: {phone_norm}")
         return True
 
-    # Только цифры для Битрикс
     phone_digits = re.sub(r'\D', '', phone_norm)
     print(f"🔍 Проверяем дубль: {phone_norm} (digits: {phone_digits})")
 
@@ -203,15 +198,10 @@ def check_duplicate(phone_norm: str) -> bool:
         "values":      [phone_digits],
         "entity_type": "CONTACT",
     })
-    # result может быть {} или {"CONTACT": [1,2,3]}
     result = resp.get("result", {})
-
-    # ✅ Защита: result тоже может быть списком
     if isinstance(result, list):
         result = {}
-
     print(f"  findByComm CONTACT: {result}")
-
     if isinstance(result, dict) and result.get("CONTACT"):
         print(f"⛔ Дубль контакта: {result['CONTACT']}")
         mark_phone_known(phone_norm)
@@ -224,12 +214,9 @@ def check_duplicate(phone_norm: str) -> bool:
         "entity_type": "LEAD",
     })
     result2 = resp2.get("result", {})
-
     if isinstance(result2, list):
         result2 = {}
-
     print(f"  findByComm LEAD: {result2}")
-
     if isinstance(result2, dict) and result2.get("LEAD"):
         print(f"⛔ Дубль лида: {result2['LEAD']}")
         mark_phone_known(phone_norm)
@@ -342,7 +329,7 @@ def parse_lead_ai(text: str) -> list[dict]:
         if cur.get('phone') and cur['phone'] != 'Не указано':
             leads.append(cur)
 
-        # Дедупликация
+        # Дедупликация внутри одного сообщения
         seen, unique = set(), []
         for lead in leads:
             p = normalize_phone(lead.get('phone', ''))
@@ -361,7 +348,7 @@ def parse_lead_ai(text: str) -> list[dict]:
 # ============================================
 # СОЗДАНИЕ В БИТРИКС
 # ============================================
-def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
+def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str) -> tuple:
     phone    = data.get('phone', '').strip()
     name     = data.get('name', 'Не указано').strip()
     address  = data.get('address', 'Не указано').strip()
@@ -387,16 +374,17 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
     try:
         time.sleep(0.3)
 
-        # ШАГ 2: Проверка дублей
+        # ШАГ 2: Проверка дублей — если есть, ПРОСТО ПРОПУСКАЕМ
         if check_duplicate(phone_norm):
             return None, "duplicate", category
 
-        # ШАГ 3: Сразу помечаем телефон — до создания записей!
-        # Это защищает от параллельных запросов пока Битрикс создаёт записи
+        # ШАГ 3: Помечаем ДО создания (защита от параллельных запросов)
         mark_phone_known(phone_norm)
 
-        type_id  = get_type_id(category)
-        title    = f"Ремонт | {name} | {address[:40]}"
+        type_id = get_type_id(category)
+        title   = f"Ремонт | {name} | {address[:40]}"
+
+        # Комментарий: структурированные данные + оригинальный текст из чата
         comments = (
             f"📢 Источник: {source_name}\n"
             f"💬 Чат: {chat_title}\n"
@@ -406,32 +394,32 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
             f"🏷️ Тип: {category}\n"
             f"💬 Комментарий: {comment}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📩 Сообщение:\n{raw_text[:800]}"
+            f"📩 Оригинал из чата:\n{raw_text}"
         )
 
-        # Контакт
-        contact_id = None
+        # ── КОНТАКТ ──────────────────────────────────
         cr = bitrix_post("crm.contact.add", {"fields": {
             "NAME":               name,
             "PHONE":              [{"VALUE": phone_norm, "VALUE_TYPE": "WORK"}],
             "ADDRESS":            address,
-            "SOURCE_ID":          "UC_CRM_SOURCE",
+            "SOURCE_ID":          source_id,
             "SOURCE_DESCRIPTION": source_name,
-            "COMMENTS":           f"Источник: {source_name}\nЧат: {chat_title}",
+            "COMMENTS":           comments,
+            "ASSIGNED_BY_ID":     0,
         }})
         contact_id = cr.get('result') if isinstance(cr, dict) else None
         print(f"{'✅' if contact_id else '⚠️'} Контакт: {contact_id or cr}")
 
-        # Лид
-        lead_id     = None
+        # ── ЛИД ──────────────────────────────────────
         lead_fields = {
             "TITLE":              title,
             "NAME":               name,
             "PHONE":              [{"VALUE": phone_norm, "VALUE_TYPE": "WORK"}],
             "ADDRESS":            address,
             "COMMENTS":           comments,
-            "SOURCE_ID":          "UC_CRM_SOURCE",
+            "SOURCE_ID":          source_id,
             "SOURCE_DESCRIPTION": source_name,
+            "ASSIGNED_BY_ID":     0,
         }
         if contact_id:
             lead_fields["CONTACT_ID"] = contact_id
@@ -440,14 +428,14 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
         lead_id = lr.get('result') if isinstance(lr, dict) else None
         print(f"{'✅' if lead_id else '⚠️'} Лид: {lead_id or lr}")
 
-        # Сделка
-        deal_id     = None
+        # ── СДЕЛКА ───────────────────────────────────
         deal_fields = {
             "TITLE":                title,
             "COMMENTS":             comments,
-            "SOURCE_ID":            "UC_CRM_SOURCE",
+            "SOURCE_ID":            source_id,
             "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
+            "ASSIGNED_BY_ID":       0,
         }
         if type_id:
             deal_fields["TYPE_ID"] = type_id
@@ -470,7 +458,6 @@ def send_to_bitrix(data: dict, source_name: str, chat_title: str) -> tuple:
         return None, "bitrix_error", category
 
     finally:
-        # Блокировка снимается ВСЕГДА
         release_lock(phone_norm)
 
 
@@ -489,18 +476,6 @@ def set_reaction(chat_id, message_id, emoji="✅"):
         print(f"👍 Реакция поставлена")
     except Exception as e:
         print(f"❌ Реакция: {e}")
-
-
-@bot.message_handler(commands=['sources'])
-def cmd_sources(msg):
-    r = bitrix_post("crm.status.list", {
-        "filter": {"ENTITY_ID": "SOURCE"}
-    })
-    items = r.get("result", [])
-    text = "📋 Источники в Битрикс:\n\n"
-    for item in items:
-        text += f"ID: `{item['STATUS_ID']}` → {item['NAME']}\n"
-    bot.reply_to(msg, text)
 
 
 @bot.message_handler(commands=['start', 'help'])
@@ -525,6 +500,16 @@ def cmd_cache(msg):
     bot.reply_to(msg, text)
 
 
+@bot.message_handler(commands=['sources'])
+def cmd_sources(msg):
+    r = bitrix_post("crm.status.list", {"filter": {"ENTITY_ID": "SOURCE"}})
+    items = r.get("result", [])
+    text  = "📋 Источники в Битрикс:\n\n"
+    for item in items:
+        text += f"ID: `{item['STATUS_ID']}` → {item['NAME']}\n"
+    bot.reply_to(msg, text)
+
+
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
     msg_key = f"{message.chat.id}_{message.message_id}"
@@ -544,11 +529,11 @@ def handle_message(message):
     if not any(kw in text.lower() for kw in KEYWORDS):
         return
 
-    chat_title  = getattr(message.chat, 'title', None) or "Личные"
-    source_name = get_source_from_chat(chat_title)
+    chat_title             = getattr(message.chat, 'title', None) or "Личные"
+    source_id, source_name = get_source_from_chat(chat_title)
 
     print(f"\n{'='*50}")
-    print(f"📨 Чат: '{chat_title}' | Источник: {source_name}")
+    print(f"📨 Чат: '{chat_title}' | Источник: {source_name} [{source_id}]")
     print(f"📝 {text[:200]}")
 
     leads = parse_lead_ai(text)
@@ -558,7 +543,7 @@ def handle_message(message):
     ok = dup = skip = 0
 
     for lead in leads:
-        lid, status, cat = send_to_bitrix(lead, source_name, chat_title)
+        lid, status, cat = send_to_bitrix(lead, source_id, source_name, chat_title)
         n = lead.get('name', '—')
         p = lead.get('phone', '—')
 
