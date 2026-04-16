@@ -64,7 +64,7 @@ def mark_phone_known(phone: str):
 
 
 # ============================================
-# КАРТЫ ИСТОЧНИКОВ (правильные SOURCE_ID из Битрикс)
+# КАРТЫ ИСТОЧНИКОВ
 # ============================================
 CHAT_SOURCE_MAP = {
     'авито':        ('REPEAT_SALE', 'Реклама Авито'),
@@ -126,7 +126,6 @@ def normalize_phone(phone: str) -> str:
 
 
 def get_source_from_chat(chat_title: str) -> tuple[str, str]:
-    """Возвращает (SOURCE_ID, название) для чата"""
     if not chat_title:
         return 'OTHER', 'Telegram'
     chat_lower = chat_title.lower().replace(' ', '')
@@ -150,7 +149,6 @@ def get_type_id(category: str) -> str | None:
 
 
 def bitrix_post(method: str, payload: dict) -> dict:
-    """Универсальный POST в Битрикс. ВСЕГДА возвращает dict."""
     url = BITRIX_URL + method
     try:
         resp = requests.post(url, json=payload, timeout=15)
@@ -179,12 +177,6 @@ def bitrix_post(method: str, payload: dict) -> dict:
 # ПРОВЕРКА ДУБЛЕЙ
 # ============================================
 def check_duplicate(phone_norm: str) -> bool:
-    """
-    1. Локальный кэш
-    2. findByComm по CONTACT
-    3. findByComm по LEAD
-    """
-    # 1️⃣ Локальный кэш — мгновенно
     if is_phone_known(phone_norm):
         print(f"⛔ [КЭШ] Дубль: {phone_norm}")
         return True
@@ -192,7 +184,6 @@ def check_duplicate(phone_norm: str) -> bool:
     phone_digits = re.sub(r'\D', '', phone_norm)
     print(f"🔍 Проверяем дубль: {phone_norm} (digits: {phone_digits})")
 
-    # 2️⃣ findByComm → CONTACT
     resp = bitrix_post("crm.duplicate.findByComm", {
         "type":        "PHONE",
         "values":      [phone_digits],
@@ -207,7 +198,6 @@ def check_duplicate(phone_norm: str) -> bool:
         mark_phone_known(phone_norm)
         return True
 
-    # 3️⃣ findByComm → LEAD
     resp2 = bitrix_post("crm.duplicate.findByComm", {
         "type":        "PHONE",
         "values":      [phone_digits],
@@ -329,7 +319,6 @@ def parse_lead_ai(text: str) -> list[dict]:
         if cur.get('phone') and cur['phone'] != 'Не указано':
             leads.append(cur)
 
-        # Дедупликация внутри одного сообщения
         seen, unique = set(), []
         for lead in leads:
             p = normalize_phone(lead.get('phone', ''))
@@ -415,7 +404,25 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         }
         if type_id:
             deal_fields["TYPE_ID"] = type_id
-        if contact
+        if contact_id:                                  # ← вот эта строка была обрезана
+            deal_fields["CONTACT_IDS"] = [contact_id]
+
+        dr      = bitrix_post("crm.deal.add", {"fields": deal_fields})
+        deal_id = dr.get('result') if isinstance(dr, dict) else None
+        print(f"{'✅' if deal_id else '⚠️'} Сделка: {deal_id or dr}")
+
+        if deal_id:
+            return deal_id, "ok", category
+
+        return None, "bitrix_error", category
+
+    except Exception as e:
+        print(f"❌ send_to_bitrix exception: {e}")
+        return None, "bitrix_error", category
+
+    finally:
+        release_lock(phone_norm)
+
 
 # ============================================
 # БОТ
