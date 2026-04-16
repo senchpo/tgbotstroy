@@ -382,15 +382,15 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         title   = f"Ремонт | {name} | {address[:40]}"
 
         comments = (
-            f"📢 Источник: {source_name}\n"
-            f"💬 Чат: {chat_title}\n"
+            f"📢 Источник: {source_name}\br"
+            f"💬 Чат: {chat_title}\br"
+            f"━━━━━━━━━━━━━━━━━━\br"
+            f"📐 Объём: {volume}\br"
+            f"📅 Срок: {deadline}\br"
+            f"🏷️ Тип: {category}\br"
+            f"💬 Доп. инфо: {comment}\br"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📐 Объём: {volume}\n"
-            f"📅 Срок: {deadline}\n"
-            f"🏷️ Тип: {category}\n"
-            f"💬 Доп. инфо: {comment}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📩 Оригинал из чата:\n{raw_text}"
+            f"📩 Оригинал из чата:\br{raw_text}"
         )
 
         # ── КОНТАКТ ──────────────────────────────────
@@ -408,7 +408,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         # ── СДЕЛКА ───────────────────────────────────
         deal_fields = {
             "TITLE":                title,
-            "COMMENT":              comments,
+            "COMMENTS":              comments,
             "ADDITIONAL_INFO":      raw_text,
             "SOURCE_ID":            source_id,
             "SOURCE_DESCRIPTION":   source_name,
