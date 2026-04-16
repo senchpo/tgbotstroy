@@ -381,17 +381,18 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         type_id = get_type_id(category)
         title   = f"Ремонт | {name} | {address[:40]}"
 
-    comments = (
-       f"Источник: {source_name}\n"
-       f"Чат: {chat_title}\n"
-       f"---\n"
-       f"Объём: {volume}\n"
-       f"Срок: {deadline}\n"
-       f"Тип: {category}\n"
-       f"Доп. инфо: {comment}\n"
-       f"---\n"
-       f"Оригинал:\n{raw_text}"
-)
+        comments = (
+            f"Источник: {source_name}\n"
+            f"Чат: {chat_title}\n"
+            f"---\n"
+            f"Объём: {volume}\n"
+            f"Срок: {deadline}\n"
+            f"Тип: {category}\n"
+            f"Доп. инфо: {comment}\n"
+            f"---\n"
+            f"Оригинал:\n{raw_text}"
+        )
+
         # ── КОНТАКТ ──────────────────────────────────
         cr = bitrix_post("crm.contact.add", {"fields": {
             "NAME":               name,
@@ -414,24 +415,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         }
         if type_id:
             deal_fields["TYPE_ID"] = type_id
-        if contact_id:
-            deal_fields["CONTACT_IDS"] = [contact_id]
-
-        dr      = bitrix_post("crm.deal.add", {"fields": deal_fields})
-        deal_id = dr.get('result') if isinstance(dr, dict) else None
-        print(f"{'✅' if deal_id else '⚠️'} Сделка: {deal_id or dr}")
-
-        if deal_id:
-            return deal_id, "ok", category
-
-        return None, "bitrix_error", category
-
-    except Exception as e:
-        print(f"❌ send_to_bitrix exception: {e}")
-        return None, "bitrix_error", category
-
-    finally:
-        release_lock(phone_norm)
+        if contact
 
 # ============================================
 # БОТ
