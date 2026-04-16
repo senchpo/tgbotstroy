@@ -374,6 +374,9 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             f"Источник: {source_name}\n"
             f"Чат: {chat_title}\n"
             f"---\n"
+            f"Имя: {name}\n"
+            f"Телефон: {phone_norm}\n"
+            f"Адрес: {address}\n"
             f"Объём: {volume}\n"
             f"Срок: {deadline}\n"
             f"Тип: {category}\n"
@@ -382,6 +385,8 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             f"Оригинал:\n{raw_text}"
         )
 
+        print(f"📝 comments repr: {repr(comments)}")
+
         # ── КОНТАКТ ──────────────────────────────────
         cr = bitrix_post("crm.contact.add", {"fields": {
             "NAME":               name,
@@ -389,27 +394,39 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             "ADDRESS":            address,
             "SOURCE_ID":          source_id,
             "SOURCE_DESCRIPTION": source_name,
-            "COMMENTS":           comments,
+            "COMMENTS":           comments,        # у контакта это поле есть
         }})
         contact_id = cr.get('result') if isinstance(cr, dict) else None
         print(f"{'✅' if contact_id else '⚠️'} Контакт: {contact_id or cr}")
 
+        # Проверим что реально записалось в контакт
+        if contact_id:
+            check = bitrix_post("crm.contact.get", {"id": contact_id})
+            print(f"🔎 Контакт COMMENTS: {repr(check.get('result', {}).get('COMMENTS', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
+
         # ── СДЕЛКА ───────────────────────────────────
         deal_fields = {
             "TITLE":                title,
-            "ADDITIONAL_INFO":      comments,
+            "COMMENTS":             comments,      # ← основное поле для сделки
+            "ADDITIONAL_INFO":      comments,      # ← запасное
             "SOURCE_ID":            source_id,
             "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
         }
         if type_id:
             deal_fields["TYPE_ID"] = type_id
-        if contact_id:                                  # ← вот эта строка была обрезана
+        if contact_id:
             deal_fields["CONTACT_IDS"] = [contact_id]
 
         dr      = bitrix_post("crm.deal.add", {"fields": deal_fields})
         deal_id = dr.get('result') if isinstance(dr, dict) else None
         print(f"{'✅' if deal_id else '⚠️'} Сделка: {deal_id or dr}")
+
+        # Проверим что реально записалось в сделку
+        if deal_id:
+            check2 = bitrix_post("crm.deal.get", {"id": deal_id})
+            print(f"🔎 Сделка COMMENTS: {repr(check2.get('result', {}).get('COMMENTS', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
+            print(f"🔎 Сделка ADDITIONAL_INFO: {repr(check2.get('result', {}).get('ADDITIONAL_INFO', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
 
         if deal_id:
             return deal_id, "ok", category
