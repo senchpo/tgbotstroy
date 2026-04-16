@@ -381,18 +381,17 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         type_id = get_type_id(category)
         title   = f"Ремонт | {name} | {address[:40]}"
 
-        comments = (
-            f"📢 Источник: {source_name}\br"
-            f"💬 Чат: {chat_title}\br"
-            f"━━━━━━━━━━━━━━━━━━\br"
-            f"📐 Объём: {volume}\br"
-            f"📅 Срок: {deadline}\br"
-            f"🏷️ Тип: {category}\br"
-            f"💬 Доп. инфо: {comment}\br"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📩 Оригинал из чата:\br{raw_text}"
-        )
-
+    comments = (
+       f"Источник: {source_name}\n"
+       f"Чат: {chat_title}\n"
+       f"---\n"
+       f"Объём: {volume}\n"
+       f"Срок: {deadline}\n"
+       f"Тип: {category}\n"
+       f"Доп. инфо: {comment}\n"
+       f"---\n"
+       f"Оригинал:\n{raw_text}"
+)
         # ── КОНТАКТ ──────────────────────────────────
         cr = bitrix_post("crm.contact.add", {"fields": {
             "NAME":               name,
@@ -408,8 +407,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         # ── СДЕЛКА ───────────────────────────────────
         deal_fields = {
             "TITLE":                title,
-            "COMMENTS":              comments,
-            "ADDITIONAL_INFO":      raw_text,
+            "ADDITIONAL_INFO":      comments,
             "SOURCE_ID":            source_id,
             "SOURCE_DESCRIPTION":   source_name,
             "UF_CRM_1775766366237": address,
