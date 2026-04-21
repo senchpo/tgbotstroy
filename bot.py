@@ -68,7 +68,7 @@ def mark_phone_known(phone: str):
 # ============================================
 CHAT_SOURCE_MAP = {
     'авито':        ('REPEAT_SALE', 'Реклама Авито'),
-    'прогмат':      ('STORE',       'Прогматремонт(Тимур)'),
+    'прагмат':      ('STORE',       'Прагматремонт(Тимур)'),
     'планремонт':   ('BOOKING',     'Планремонта(Денис)'),
     'ремонкаждому': ('CALL',        'РемонКаждому(Марина)'),
     'каждому':      ('CALL',        'РемонКаждому(Марина)'),
@@ -370,10 +370,8 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         type_id = get_type_id(category)
         title   = f"Ремонт | {name} | {address[:40]}"
 
+        # ── КОММЕНТАРИЙ (без строк Источник и Чат) ───
         comments = (
-            f"Источник: {source_name}\n"
-            f"Чат: {chat_title}\n"
-            f"---\n"
             f"Имя: {name}\n"
             f"Телефон: {phone_norm}\n"
             f"Адрес: {address}\n"
@@ -385,7 +383,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             f"Оригинал:\n{raw_text}"
         )
 
-        print(f"📝 comments repr: {repr(comments)}")
+        print(f"📝 comments:\n{comments}")
 
         # ── КОНТАКТ ──────────────────────────────────
         cr = bitrix_post("crm.contact.add", {"fields": {
@@ -394,42 +392,41 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             "ADDRESS":            address,
             "SOURCE_ID":          source_id,
             "SOURCE_DESCRIPTION": source_name,
-            "COMMENTS":           comments,        # у контакта это поле есть
+            "COMMENTS":           comments,
         }})
         contact_id = cr.get('result') if isinstance(cr, dict) else None
         print(f"{'✅' if contact_id else '⚠️'} Контакт: {contact_id or cr}")
 
-        # Проверим что реально записалось в контакт
-        if contact_id:
-            check = bitrix_post("crm.contact.get", {"id": contact_id})
-            print(f"🔎 Контакт COMMENTS: {repr(check.get('result', {}).get('COMMENTS', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
-
-        # ── СДЕЛКА ───────────────────────────────────
-        deal_fields = {
-            "TITLE":                title,
-            "COMMENTS":             comments,      # ← основное поле для сделки
-            "ADDITIONAL_INFO":      comments,      # ← запасное
-            "SOURCE_ID":            source_id,
-            "SOURCE_DESCRIPTION":   source_name,
-            "UF_CRM_1775766366237": address,
+        # ── ЛИД (вместо сделки) ──────────────────────
+        lead_fields = {
+            "TITLE":              title,
+            "NAME":               name,
+            "PHONE":              [{"VALUE": phone_norm, "VALUE_TYPE": "WORK"}],
+            "ADDRESS":            address,
+            "COMMENTS":           comments,
+            "SOURCE_ID":          source_id,
+            "SOURCE_DESCRIPTION": source_name,
         }
+
+        # Тип ремонта → TYPE_ID лида
         if type_id:
-            deal_fields["TYPE_ID"] = type_id
+            lead_fields["TYPE_ID"] = type_id
+
+        # Привязка контакта к лиду
         if contact_id:
-            deal_fields["CONTACT_IDS"] = [contact_id]
+            lead_fields["CONTACT_ID"] = contact_id
 
-        dr      = bitrix_post("crm.deal.add", {"fields": deal_fields})
-        deal_id = dr.get('result') if isinstance(dr, dict) else None
-        print(f"{'✅' if deal_id else '⚠️'} Сделка: {deal_id or dr}")
+        lr      = bitrix_post("crm.lead.add", {"fields": lead_fields})
+        lead_id = lr.get('result') if isinstance(lr, dict) else None
+        print(f"{'✅' if lead_id else '⚠️'} Лид: {lead_id or lr}")
 
-        # Проверим что реально записалось в сделку
-        if deal_id:
-            check2 = bitrix_post("crm.deal.get", {"id": deal_id})
-            print(f"🔎 Сделка COMMENTS: {repr(check2.get('result', {}).get('COMMENTS', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
-            print(f"🔎 Сделка ADDITIONAL_INFO: {repr(check2.get('result', {}).get('ADDITIONAL_INFO', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
+        # Проверяем что записалось
+        if lead_id:
+            check = bitrix_post("crm.lead.get", {"id": lead_id})
+            print(f"🔎 Лид COMMENTS: {repr(check.get('result', {}).get('COMMENTS', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
 
-        if deal_id:
-            return deal_id, "ok", category
+        if lead_id:
+            return lead_id, "ok", category
 
         return None, "bitrix_error", category
 
