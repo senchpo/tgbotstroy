@@ -226,11 +226,13 @@ def parse_lead_ai(text: str) -> list[dict]:
         categories_list = "\n".join([f"- {k}" for k in REPAIR_TYPE_MAP.keys()])
 
         payload = {
-            "model": "qwen/qwen3-32b",
-            "temperature": 0,
-            "messages": [{
-                "role": "user",
-                "content": f"""Ты парсер заявок на ремонт квартир.
+    "model": "qwen/qwen3-32b",
+    "temperature": 0,
+    "thinking": False,          # ← ДОБАВИТЬ
+    "messages": [{
+        "role": "user",
+        "content": f"""/no_think
+Ты парсер заявок на ремонт квартир.
 Найди всех клиентов и верни СТРОГО в формате:
 
 ЛИД 1:
@@ -247,6 +249,7 @@ def parse_lead_ai(text: str) -> list[dict]:
 - ТЕЛЕФОН: формат +7XXXXXXXXXX
 - Если нет данных — пиши: Не указано
 - Несколько клиентов → ЛИД 1, ЛИД 2 и т.д.
+- Отвечай ТОЛЬКО в указанном формате, без рассуждений
 
 КАТЕГОРИЯ — одна строка из списка:
 {categories_list}
@@ -269,7 +272,6 @@ def parse_lead_ai(text: str) -> list[dict]:
 {text}"""
             }]
         }
-
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
