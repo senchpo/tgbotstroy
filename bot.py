@@ -228,7 +228,6 @@ def parse_lead_ai(text: str) -> list[dict]:
         payload = {
     "model": "qwen/qwen3-32b",
     "temperature": 0,
-    "thinking": False,          # ← ДОБАВИТЬ
     "messages": [{
         "role": "user",
         "content": f"""/no_think
