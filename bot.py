@@ -227,7 +227,7 @@ def parse_lead_ai(text: str) -> list[dict]:
         categories_list = "\n".join([f"- {k}" for k in REPAIR_TYPE_MAP.keys()])
 
         payload = {
-    "model": "llama-3.3-70b-versatile",
+    "model": "openai/gpt-oss-120b",
     "temperature": 0,
     "messages": [{
         "role": "user",
