@@ -40,6 +40,12 @@ Run offline tests without a Telegram token or Bitrix24 credentials:
 python -m unittest discover -s tests -v
 ```
 
+For a **read-only metadata audit**, run `python audit_crm_fields.py` in a
+trusted environment with the existing `BITRIX_URL` variable. It calls only
+`crm.lead.fields`, `crm.contact.fields`, `crm.lead.userfield.list`, and
+`crm.status.list`. It prints field/status metadata, never the webhook URL or
+customer records. Do not paste the webhook URL into an issue, commit, or log.
+
 The integration still requires a live staging smoke test before production.
 Known limitations: in-memory duplicate cache is not persistent, the bot has no
 durable processing queue, and Bitrix contact creation may succeed even if lead
