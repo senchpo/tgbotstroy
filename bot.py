@@ -12,6 +12,7 @@ from datetime import datetime
 TOKEN        = os.environ.get("TOKEN", "")
 BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+USE_AI_PARSER = os.environ.get('USE_AI_PARSER', 'false').lower() == 'true'
 
 # ============================================
 # БЛОКИРОВКИ ПО ТЕЛЕФОНУ
@@ -116,7 +117,62 @@ KEYWORDS = [
     'покраска', 'штукатурка', 'вторичка', 'новостройка',
     'под ключ', 'чистовая', 'черновая', 'офис',
     'столешница', 'витрина', 'помещение', 'магазин',
+    'с/у', 'с.у.', 'плитка', 'плиточные', 'плиточник',
+    'ванна', 'туалет', 'заявка', 'отделка', 'электрика',
 ]
+
+STATUS_MARKERS = (
+    'не дозвони', 'недозвон', 'перезвон', 'не актуал', 'неактуал',
+    'отказ', 'смета отправ', 'выезд состоял', 'замер состоял',
+    'договор подпис', 'в работе', 'закрыт', 'оплат',
+)
+
+PHONE_PATTERN = re.compile(
+    r'(?<!\d)(?:\+7|7|8)[\s().-]*\d{3}[\s().-]*\d{3}'
+    r'[\s().-]*\d{2}[\s().-]*\d{2}(?!\d)'
+)
+
+
+def extract_phones(text: str) -> list[str]:
+    """Find Russian mobile/landline numbers without relying on repair keywords."""
+    return list(dict.fromkeys(normalize_phone(m.group()) for m in PHONE_PATTERN.finditer(text)))
+
+
+def is_new_lead_message(text: str) -> bool:
+    """Require a phone AND a work/request signal; reject obvious status posts."""
+    lowered = text.casefold()
+    if not extract_phones(text):
+        return False
+    if any(marker in lowered for marker in STATUS_MARKERS):
+        return False
+    return any(keyword in lowered for keyword in KEYWORDS)
+
+
+def parse_lead_fallback(text: str) -> list[dict]:
+    """Keep short, phone-bearing requests usable when the AI is unavailable."""
+    phones = extract_phones(text)
+    lowered = text.casefold()
+    kind = ('Капитальный' if any(x in lowered for x in ('капитальн', 'под ключ'))
+            else 'Косметический' if 'косметическ' in lowered else None)
+    room = ('сан узла' if any(x in lowered for x in ('с/у', 'с.у.', 'сануз', 'сан уз', 'ванн', 'туалет'))
+            else 'кухни' if 'кухн' in lowered else 'комнаты' if 'комнат' in lowered else None)
+    category = f'Ремонт {room} {kind}' if room and kind else ''
+    leads = []
+    for phone in phones:
+        raw_match = next((m for m in PHONE_PATTERN.finditer(text)
+                          if normalize_phone(m.group()) == phone), None)
+        suffix = text[raw_match.end():].strip(' .,;:-') if raw_match else ''
+        first_word = re.match(r'([А-ЯЁ][а-яё]+)\b', suffix)
+        name = first_word.group(1) if first_word else 'Не указано'
+        metro = re.search(r'\b[мМ]\.?\s+([А-ЯЁа-яё][А-ЯЁа-яё-]+)', text)
+        address = f'м. {metro.group(1)}' if metro else 'Не указано'
+        leads.append({
+            'phone': phone, 'name': name, 'address': address,
+            'work_volume': text, 'deadline': 'Не указано',
+            'category': category, 'comment': 'Автоматический разбор без ИИ',
+            'raw_text': text,
+        })
+    return leads
 
 _processed_msgs: set[str] = set()
 _processed_msgs_mutex = threading.Lock()
@@ -142,6 +198,20 @@ def get_source_from_chat(chat_title: str) -> tuple[str, str]:
         if kw.lower() in chat_lower:
             return src_id, src_name
     return 'OTHER', f'Telegram: {chat_title}'
+
+
+def get_source_from_message(chat_title: str, text: str) -> tuple[str, str]:
+    """Use an explicit operator tag only when the group has no known source."""
+    source_id, source_name = get_source_from_chat(chat_title)
+    if source_id != 'OTHER':
+        return source_id, source_name
+    operator = re.search(r'\b[Оо]п\.?\s+([А-ЯЁа-яё]+)', text)
+    if operator:
+        operator_name = operator.group(1).lower()
+        for key, value in CHAT_SOURCE_MAP.items():
+            if key.lower() == operator_name:
+                return value
+    return source_id, source_name
 
 
 def get_type_id(category: str) -> str | None:
@@ -198,6 +268,8 @@ def check_duplicate(phone_norm: str) -> bool:
         "values":      [phone_digits],
         "entity_type": "CONTACT",
     })
+    if 'result' not in resp or 'error' in resp:
+        raise RuntimeError('Не удалось проверить дубли контактов')
     result = resp.get("result", {})
     if isinstance(result, list):
         result = {}
@@ -212,6 +284,8 @@ def check_duplicate(phone_norm: str) -> bool:
         "values":      [phone_digits],
         "entity_type": "LEAD",
     })
+    if 'result' not in resp2 or 'error' in resp2:
+        raise RuntimeError('Не удалось проверить дубли лидов')
     result2 = resp2.get("result", {})
     if isinstance(result2, list):
         result2 = {}
@@ -375,8 +449,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         if check_duplicate(phone_norm):
             return None, "duplicate", category
 
-        mark_phone_known(phone_norm)
-
         type_id = get_type_id(category)
         title   = f"Ремонт | {name} | {address[:40]}"
 
@@ -436,6 +508,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             print(f"🔎 Лид COMMENTS: {repr(check.get('result', {}).get('COMMENTS', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
 
         if lead_id:
+            mark_phone_known(phone_norm)
             return lead_id, "ok", category
 
         return None, "bitrix_error", category
@@ -513,19 +586,25 @@ def handle_message(message):
         return
     if getattr(message.from_user, 'is_bot', False):
         return
-    if not any(kw in text.lower() for kw in KEYWORDS):
+    # A valid phone is sufficient: contractors often abbreviate the service
+    # (e.g. "с/у плиточные работы") or omit repair keywords altogether.
+    if not is_new_lead_message(text):
         return
 
     chat_title             = getattr(message.chat, 'title', None) or "Личные"
-    source_id, source_name = get_source_from_chat(chat_title)
+    source_id, source_name = get_source_from_message(chat_title, text)
 
     print(f"\n{'='*50}")
     print(f"📨 Чат: '{chat_title}' | Источник: {source_name} [{source_id}]")
     print(f"📝 {text[:200]}")
 
-    leads = parse_lead_ai(text)
+    leads = parse_lead_ai(text) if USE_AI_PARSER and GROQ_API_KEY else []
+    actual_phones = set(extract_phones(text))
+    leads = [lead for lead in leads
+             if normalize_phone(lead.get('phone', '')) in actual_phones]
     if not leads:
-        return
+        print('ℹ️ Используем локальный парсер заявки')
+        leads = parse_lead_fallback(text)
 
     ok = dup = skip = 0
 
@@ -552,6 +631,8 @@ def handle_message(message):
         set_reaction(message.chat.id, message.message_id, "❌")
     elif skip:
         set_reaction(message.chat.id, message.message_id, "🤔")
+    else:
+        print(f'❌ Заявка не создана: chat={message.chat.id} msg={message.message_id}')
 
 
 # ============================================
@@ -560,7 +641,8 @@ def handle_message(message):
 if __name__ == "__main__":
     print("✅ Бот стартует...")
     try:
-        bot.delete_webhook(drop_pending_updates=True)
+        # Preserve updates received while the service was offline.
+        bot.delete_webhook(drop_pending_updates=False)
         print("✅ Вебхук удалён")
     except Exception as e:
         print(f"⚠️ Вебхук: {e}")
