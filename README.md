@@ -52,11 +52,17 @@ durable processing queue, and Bitrix contact creation may succeed even if lead
 creation fails. Real CRM credentials and production messages are not used by
 the offline tests. No Railway deployment is made as part of these changes.
 
-Each lead comment now includes a deterministic Telegram request UID. It is
-**not** yet enforced as a unique field in Bitrix24; therefore exactly-once
-creation after restarts is **not guaranteed**. The `UF_CRM_REQUEST_UID` field
-visible in the portal UI must first be mapped to its real REST code and then
-integrated into a durable deduplication/reconciliation workflow.
+The field labelled `UF_CRM_REQUEST_UID` was confirmed by a **read-only** REST
+audit of the production portal on 2026-11-18 as `UF_CRM_1776153852` (string).
+The bot now writes a deterministic Telegram request UID to this field and
+checks `crm.lead.list` before creating a lead. Existing contacts can therefore
+receive new leads without being blocked by phone-only deduplication.
+However, this lookup is not an atomic uniqueness constraint: simultaneous
+replicas, a network timeout during creation, or a crash between the lookup and
+write can still create duplicates. Exactly-once delivery is **not guaranteed**
+until a durable outbox/reconciliation workflow and integration test exist.
+The portal also does not expose `TYPE_ID` in `crm.lead.fields`; repair category
+remains in `COMMENTS` instead of being sent to an unsupported field.
 
 PII in routine logging has been reduced. Existing Railway historical logs are
 not modified or deleted by this patch.
