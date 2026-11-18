@@ -47,6 +47,13 @@ trusted environment with the existing `BITRIX_URL` variable. It calls only
 customer records. Do not paste the webhook URL into an issue, commit, or log.
 
 The integration still requires a live staging smoke test before production.
+An opt-in test harness is available at `tests/test_bitrix_integration.py`.
+It refuses any host other than `b24-frslge.bitrix24.ru`, requires the UID
+field to exist before writing, creates a single synthetic contact+lead,
+verifies their linkage and UID, and deletes only the IDs it created in a
+`finally` block. If cleanup fails, it reports the exact IDs for manual
+recovery. It is **never** invoked by offline unit tests or normal bot startup.
+Run only with `TEST_BITRIX_URL` configured in a trusted test environment.
 Known limitations: in-memory duplicate cache is not persistent, the bot has no
 durable processing queue, and Bitrix contact creation may succeed even if lead
 creation fails. Real CRM credentials and production messages are not used by
