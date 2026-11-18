@@ -5,6 +5,7 @@ import os
 import re
 import threading
 from datetime import datetime
+from intake import classify_message, event_uid
 
 # ============================================
 # КОНФИГ
@@ -32,18 +33,18 @@ def acquire_lock(phone: str) -> bool:
 
         if phone in _phone_locks:
             age = (now - _phone_locks[phone]).total_seconds()
-            print(f"🔒 Уже обрабатывается ({age:.0f}с): {phone}")
+            print(f"🔒 Номер уже обрабатывается ({age:.0f}с)")
             return False
 
         _phone_locks[phone] = now
-        print(f"🔓 Захвачена блокировка: {phone}")
+        print('🔓 Захвачена блокировка номера')
         return True
 
 
 def release_lock(phone: str):
     with _locks_mutex:
         _phone_locks.pop(phone, None)
-        print(f"🔓 Снята блокировка: {phone}")
+        print('🔓 Снята блокировка номера')
 
 
 # ============================================
@@ -61,7 +62,7 @@ def is_phone_known(phone: str) -> bool:
 def mark_phone_known(phone: str):
     with _known_phones_mutex:
         _known_phones.add(phone)
-        print(f"📝 Добавлен в кэш: {phone}")
+        print('📝 Номер добавлен в кэш')
 
 
 # ============================================
@@ -163,12 +164,23 @@ def parse_lead_fallback(text: str) -> list[dict]:
                           if normalize_phone(m.group()) == phone), None)
         suffix = text[raw_match.end():].strip(' .,;:-') if raw_match else ''
         first_word = re.match(r'([А-ЯЁ][а-яё]+)\b', suffix)
+        if not first_word and raw_match:
+            prefix = text[:raw_match.start()].splitlines()[-1].strip(' .,;:-')
+            first_word = re.search(r'([А-ЯЁ][а-яё]+)\s*$', prefix)
         name = first_word.group(1) if first_word else 'Не указано'
         metro = re.search(r'\b[мМ]\.?\s+([А-ЯЁа-яё][А-ЯЁа-яё-]+)', text)
         address = f'м. {metro.group(1)}' if metro else 'Не указано'
+        if not metro:
+            for line in text.splitlines():
+                line = line.strip()
+                if re.search(r'\b(улица|ул\.|проспект|пр-т|шоссе|переулок|д\.)\b',
+                             line, re.IGNORECASE) and not PHONE_PATTERN.search(line):
+                    address = line[:200]
+                    break
+        date_match = re.search(r'\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b', text)
         leads.append({
             'phone': phone, 'name': name, 'address': address,
-            'work_volume': text, 'deadline': 'Не указано',
+            'work_volume': text, 'deadline': date_match.group() if date_match else 'Не указано',
             'category': category, 'comment': 'Автоматический разбор без ИИ',
             'raw_text': text,
         })
@@ -261,7 +273,7 @@ def check_duplicate(phone_norm: str) -> bool:
         return True
 
     phone_digits = re.sub(r'\D', '', phone_norm)
-    print(f"🔍 Проверяем дубль: {phone_norm} (digits: {phone_digits})")
+    print('🔍 Проверяем дубль по номеру')
 
     resp = bitrix_post("crm.duplicate.findByComm", {
         "type":        "PHONE",
@@ -273,9 +285,9 @@ def check_duplicate(phone_norm: str) -> bool:
     result = resp.get("result", {})
     if isinstance(result, list):
         result = {}
-    print(f"  findByComm CONTACT: {result}")
+    print(f'  Совпадений контактов: {len(result.get("CONTACT", []))}')
     if isinstance(result, dict) and result.get("CONTACT"):
-        print(f"⛔ Дубль контакта: {result['CONTACT']}")
+        print('⛔ Найден существующий контакт')
         mark_phone_known(phone_norm)
         return True
 
@@ -289,13 +301,13 @@ def check_duplicate(phone_norm: str) -> bool:
     result2 = resp2.get("result", {})
     if isinstance(result2, list):
         result2 = {}
-    print(f"  findByComm LEAD: {result2}")
+    print(f'  Совпадений лидов: {len(result2.get("LEAD", []))}')
     if isinstance(result2, dict) and result2.get("LEAD"):
-        print(f"⛔ Дубль лида: {result2['LEAD']}")
+        print('⛔ Найден существующий лид')
         mark_phone_known(phone_norm)
         return True
 
-    print(f"✅ Дублей нет: {phone_norm}")
+    print('✅ Совпадений нет')
     return False
 
 
@@ -368,7 +380,7 @@ def parse_lead_ai(text: str) -> list[dict]:
             return []
 
         ai_text = rj['choices'][0]['message']['content']
-        print(f"🤖 AI:\n{ai_text}")
+        print('🤖 Получен ответ от AI-парсера')
 
         leads, cur = [], {}
 
@@ -430,6 +442,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
     comment  = data.get('comment', 'Не указано').strip()
     category = data.get('category', '').strip()
     raw_text = data.get('raw_text', '')
+    request_uid = data.get('request_uid', '')
 
     if not phone or phone == 'Не указано':
         return None, "no_phone", category
@@ -437,7 +450,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
     phone_norm = normalize_phone(phone)
 
     if len(re.sub(r'\D', '', phone_norm)) < 11:
-        print(f"⚠️ Некорректный телефон: {phone} → {phone_norm}")
+        print('⚠️ Некорректный телефон')
         return None, "no_phone", category
 
     if not acquire_lock(phone_norm):
@@ -461,11 +474,12 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             f"Срок: {deadline}\n"
             f"Тип: {category}\n"
             f"Доп. инфо: {comment}\n"
+            f"Telegram request UID: {request_uid}\n"
             f"---\n"
             f"Оригинал:\n{raw_text}"
         )
 
-        print(f"📝 comments:\n{comments}")
+        print('📝 Подготовлен комментарий к CRM без вывода персональных данных')
 
         # ── КОНТАКТ ──────────────────────────────────
         cr = bitrix_post("crm.contact.add", {"fields": {
@@ -505,7 +519,8 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         # Проверяем что записалось
         if lead_id:
             check = bitrix_post("crm.lead.get", {"id": lead_id})
-            print(f"🔎 Лид COMMENTS: {repr(check.get('result', {}).get('COMMENTS', 'ПОЛЕ ОТСУТСТВУЕТ'))}")
+            saved = check.get('result', {}).get('COMMENTS', '')
+            print(f"🔎 Комментарий лида подтверждён: {bool(saved)}")
 
         if lead_id:
             mark_phone_known(phone_norm)
@@ -588,7 +603,10 @@ def handle_message(message):
         return
     # A valid phone is sufficient: contractors often abbreviate the service
     # (e.g. "с/у плиточные работы") or omit repair keywords altogether.
-    if not is_new_lead_message(text):
+    decision = classify_message(text)
+    if decision.kind != 'new_request':
+        print(f'ℹ️ Пропущено сообщение: {decision.kind}/{decision.reason} '
+              f'chat={message.chat.id} msg={message.message_id}')
         return
 
     chat_title             = getattr(message.chat, 'title', None) or "Личные"
@@ -596,7 +614,7 @@ def handle_message(message):
 
     print(f"\n{'='*50}")
     print(f"📨 Чат: '{chat_title}' | Источник: {source_name} [{source_id}]")
-    print(f"📝 {text[:200]}")
+    print(f'📝 Новая заявка: chat={message.chat.id} msg={message.message_id}')
 
     leads = parse_lead_ai(text) if USE_AI_PARSER and GROQ_API_KEY else []
     actual_phones = set(extract_phones(text))
@@ -609,16 +627,18 @@ def handle_message(message):
     ok = dup = skip = 0
 
     for lead in leads:
+        lead['request_uid'] = event_uid(message.chat.id, message.message_id,
+                                        normalize_phone(lead.get('phone', '')))
         lid, status, cat = send_to_bitrix(lead, source_id, source_name, chat_title)
         n = lead.get('name', '—')
         p = lead.get('phone', '—')
 
         if status == "ok":
             ok += 1
-            print(f"✅ ID:{lid} | {n} | {p} | {cat}")
+            print(f'✅ Создан лид ID:{lid}')
         elif status == "duplicate":
             dup += 1
-            print(f"⛔ Дубль: {n} | {p}")
+            print('⛔ Заявка распознана как дубль')
         elif status == "no_phone":
             skip += 1
             print(f"⚠️ Нет телефона: {n}")
