@@ -128,6 +128,12 @@ class ParsingTests(unittest.TestCase):
              self.assertRaisesRegex(RuntimeError, 'Не удалось проверить'):
             bot.check_duplicate('+79775179200')
 
+    def test_empty_contact_search_result_formats(self):
+        for empty in ({}, []):
+            with self.subTest(result=empty), \
+                 patch.object(bot, 'bitrix_post', return_value={'result': empty}):
+                self.assertIsNone(bot.find_contact_by_phone('+79775179200'))
+
 
 if __name__ == '__main__':
     unittest.main()
