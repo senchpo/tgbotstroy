@@ -335,9 +335,14 @@ def find_contact_by_phone(phone_norm: str) -> int | None:
     result = bitrix_post('crm.duplicate.findByComm', {
         'type': 'PHONE', 'values': [digits], 'entity_type': 'CONTACT',
     })
-    if 'error' in result or not isinstance(result.get('result'), dict):
+    if 'error' in result or 'result' not in result:
         raise RuntimeError('Не удалось проверить контакт по телефону')
-    matches = result['result'].get('CONTACT', [])
+    data = result['result']
+    if isinstance(data, list) and not data:
+        return None
+    if not isinstance(data, dict):
+        raise RuntimeError('Неожиданный формат поиска контакта')
+    matches = data.get('CONTACT', [])
     return int(matches[0]) if matches else None
 
 
