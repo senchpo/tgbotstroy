@@ -34,6 +34,14 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(lead['address'], 'м. Крылатское')
         self.assertIn('плиточные работы', lead['work_volume'])
 
+    def test_multiline_contact_details_without_ai(self):
+        raw = ('Замер на завтра 19.11\nГерман +7 916 683-21-25\n'
+               'Москва Пятницкая улица, 8\nвтор кап 100кв\nбез проживания')
+        lead, = bot.parse_lead_fallback(raw)
+        self.assertEqual(lead['name'], 'Герман')
+        self.assertEqual(lead['address'], 'Москва Пятницкая улица, 8')
+        self.assertEqual(lead['deadline'], '19.11')
+
     def test_phone_formats(self):
         msg = '+7 (977) 517-92-00; 8 977 517 92 00'
         self.assertEqual(bot.extract_phones(msg), ['+79775179200'])
