@@ -86,7 +86,8 @@ class ParsingTests(unittest.TestCase):
         reaction.assert_called_once()
 
     def test_failed_lead_does_not_enter_duplicate_cache(self):
-        with patch.object(bot, 'check_duplicate', return_value=False), \
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'find_contact_by_phone', return_value=None), \
              patch.object(bot, 'bitrix_post', side_effect=[{'result': 42}, {'error': 'failed'}]), \
              patch.object(bot.time, 'sleep'):
             lead_id, status, _ = bot.send_to_bitrix({
@@ -95,6 +96,32 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(lead_id)
         self.assertEqual(status, 'bitrix_error')
         self.assertFalse(bot.is_phone_known('+79775179200'))
+
+    def test_same_telegram_event_is_not_created_twice(self):
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=123), \
+             patch.object(bot, 'bitrix_post') as post, \
+             patch.object(bot.time, 'sleep'):
+            _, status, _ = bot.send_to_bitrix({
+                'phone': '89775179200', 'request_uid': 'tg_123',
+            }, 'OTHER', 'Telegram', 'Общая группа')
+        self.assertEqual(status, 'duplicate')
+        post.assert_not_called()
+
+    def test_existing_contact_can_have_new_request(self):
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'find_contact_by_phone', return_value=42), \
+             patch.object(bot, 'bitrix_post', side_effect=[
+                 {'result': 321}, {'result': {'COMMENTS': 'yes'}}
+             ]) as post, patch.object(bot.time, 'sleep'):
+            lead_id, status, _ = bot.send_to_bitrix({
+                'phone': '89775179200', 'request_uid': 'tg_unique',
+            }, 'OTHER', 'Telegram', 'Общая группа')
+        self.assertEqual((lead_id, status), (321, 'ok'))
+        self.assertEqual(post.call_args_list[0].args[0], 'crm.lead.add')
+        fields = post.call_args_list[0].args[1]['fields']
+        self.assertEqual(fields['CONTACT_ID'], 42)
+        self.assertEqual(fields['UF_CRM_1776153852'], 'tg_unique')
+        self.assertNotIn('TYPE_ID', fields)
 
     def test_duplicate_lookup_failure_aborts_creation(self):
         with patch.object(bot, 'bitrix_post', return_value={}), \
