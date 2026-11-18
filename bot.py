@@ -311,6 +311,36 @@ def check_duplicate(phone_norm: str) -> bool:
     return False
 
 
+REQUEST_UID_FIELD = 'UF_CRM_1776153852'  # Verified via production READ-ONLY REST metadata
+
+
+def find_lead_by_request_uid(request_uid: str) -> int | None:
+    """Deduplicate an event, not a customer phone number."""
+    if not request_uid:
+        return None
+    result = bitrix_post('crm.lead.list', {
+        'filter': {REQUEST_UID_FIELD: request_uid},
+        'select': ['ID', REQUEST_UID_FIELD],
+    })
+    if 'error' in result or not isinstance(result.get('result'), list):
+        raise RuntimeError('Не удалось проверить UID заявки')
+    for item in result['result']:
+        if item.get(REQUEST_UID_FIELD) == request_uid:
+            return int(item['ID'])
+    return None
+
+
+def find_contact_by_phone(phone_norm: str) -> int | None:
+    digits = re.sub(r'\D', '', phone_norm)
+    result = bitrix_post('crm.duplicate.findByComm', {
+        'type': 'PHONE', 'values': [digits], 'entity_type': 'CONTACT',
+    })
+    if 'error' in result or not isinstance(result.get('result'), dict):
+        raise RuntimeError('Не удалось проверить контакт по телефону')
+    matches = result['result'].get('CONTACT', [])
+    return int(matches[0]) if matches else None
+
+
 # ============================================
 # AI ПАРСИНГ
 # ============================================
@@ -459,10 +489,10 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
     try:
         time.sleep(0.3)
 
-        if check_duplicate(phone_norm):
+        if find_lead_by_request_uid(request_uid):
             return None, "duplicate", category
 
-        type_id = get_type_id(category)
+        contact_id = find_contact_by_phone(phone_norm)
         title   = f"Ремонт | {name} | {address[:40]}"
 
         # ── КОММЕНТАРИЙ (без строк Источник и Чат) ───
@@ -482,16 +512,21 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         print('📝 Подготовлен комментарий к CRM без вывода персональных данных')
 
         # ── КОНТАКТ ──────────────────────────────────
-        cr = bitrix_post("crm.contact.add", {"fields": {
-            "NAME":               name,
-            "PHONE":              [{"VALUE": phone_norm, "VALUE_TYPE": "WORK"}],
-            "ADDRESS":            address,
-            "SOURCE_ID":          source_id,
-            "SOURCE_DESCRIPTION": source_name,
-            "COMMENTS":           comments,
-        }})
-        contact_id = cr.get('result') if isinstance(cr, dict) else None
-        print(f"{'✅' if contact_id else '⚠️'} Контакт: {contact_id or cr}")
+        if contact_id:
+            print(f'ℹ️ Используем существующий контакт ID:{contact_id}')
+        else:
+            cr = bitrix_post("crm.contact.add", {"fields": {
+                "NAME":               name,
+                "PHONE":              [{"VALUE": phone_norm, "VALUE_TYPE": "WORK"}],
+                "ADDRESS":            address,
+                "SOURCE_ID":          source_id,
+                "SOURCE_DESCRIPTION": source_name,
+                "COMMENTS":           comments,
+            }})
+            contact_id = cr.get('result') if isinstance(cr, dict) else None
+            if not contact_id:
+                raise RuntimeError('Не удалось создать контакт')
+            print(f'✅ Контакт создан ID:{contact_id}')
 
         # ── ЛИД (вместо сделки) ──────────────────────
         lead_fields = {
@@ -504,9 +539,10 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             "SOURCE_DESCRIPTION": source_name,
         }
 
-        # Тип ремонта → TYPE_ID лида
-        if type_id:
-            lead_fields["TYPE_ID"] = type_id
+        # TYPE_ID is not available in this portal's crm.lead.fields.
+        # The repair category is preserved in COMMENTS, not an invalid field.
+        if request_uid:
+            lead_fields[REQUEST_UID_FIELD] = request_uid
 
         # Привязка контакта к лиду
         if contact_id:
@@ -523,7 +559,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             print(f"🔎 Комментарий лида подтверждён: {bool(saved)}")
 
         if lead_id:
-            mark_phone_known(phone_norm)
             return lead_id, "ok", category
 
         return None, "bitrix_error", category
