@@ -43,6 +43,30 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(lead['address'], 'м. Крылатское')
         self.assertIn('плиточные работы', lead['work_volume'])
 
+    def test_phone_only_and_missing_fields_never_raise(self):
+        for raw in ('89775179200', '+7 (977) 517-92-00',
+                    '8 977 517 92 00.', '89775179200 Борис',
+                    'Борис 89775179200', '89775179200 кухня',
+                    '89775179200\n', '\n89775179200'):
+            with self.subTest(raw=raw):
+                lead, = bot.parse_lead_fallback(raw)
+                self.assertEqual(lead['phone'], '+79775179200')
+                self.assertTrue(lead['name'])
+                self.assertTrue(lead['address'])
+
+    def test_phone_only_event_queued_and_sent(self):
+        message = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=1234, title=None),
+            message_id=567, text='89775179200',
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'send_to_bitrix', return_value=(123, 'ok', '')) as send, \
+             patch.object(bot, 'set_reaction'):
+            bot.handle_message(message)
+        self.assertEqual(send.call_args.args[0]['name'], 'Не указано')
+        self.assertEqual(send.call_args.args[1], 'OTHER')
+        self.assertEqual(bot._delivery_queue.ready(), [])
+
     def test_multiline_contact_details_without_ai(self):
         raw = ('Замер на завтра 19.11\nГерман +7 916 683-21-25\n'
                'Москва Пятницкая улица, 8\nвтор кап 100кв\nбез проживания')

@@ -169,7 +169,8 @@ def parse_lead_fallback(text: str) -> list[dict]:
         suffix = text[raw_match.end():].strip(' .,;:-') if raw_match else ''
         first_word = re.match(r'([А-ЯЁ][а-яё]+)\b', suffix)
         if not first_word and raw_match:
-            prefix = text[:raw_match.start()].splitlines()[-1].strip(' .,;:-')
+            prefix_lines = text[:raw_match.start()].splitlines()
+            prefix = prefix_lines[-1].strip(' .,;:-') if prefix_lines else ''
             first_word = re.search(r'([А-ЯЁ][а-яё]+)\s*$', prefix)
         name = first_word.group(1) if first_word else 'Не указано'
         metro = re.search(r'\b[мМ]\.?\s+([А-ЯЁа-яё][А-ЯЁа-яё-]+)', text)
@@ -733,7 +734,11 @@ def retry_pending():
 
 def retry_loop():
     while True:
-        retry_pending()
+        try:
+            retry_pending()
+        except Exception as exc:
+            # Do not permanently stop retries on an incidental SQLite/CRM error.
+            print(f'⚠️ Цикл повторов: {type(exc).__name__}')
         time.sleep(20)
 
 

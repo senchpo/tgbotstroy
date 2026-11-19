@@ -39,6 +39,19 @@ class DeliveryQueueTests(unittest.TestCase):
         with patch('delivery_queue.time.time', return_value=1032):
             self.assertEqual(len(queue.ready()), 1)
 
+    def test_stress_2000_events_reopen_and_replay(self):
+        queue = DeliveryQueue(self.path)
+        for i in range(2000):
+            queue.enqueue(-100, i, 'Партнёр', f'89{i:09d}')
+        reopened = DeliveryQueue(self.path)
+        count = 0
+        while batch := reopened.ready(limit=137):
+            for chat_id, message_id, _, _ in batch:
+                reopened.complete(chat_id, message_id)
+                count += 1
+        self.assertEqual(count, 2000)
+        self.assertEqual(DeliveryQueue(self.path).ready(), [])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -69,6 +69,28 @@ class IntakeClassifierTests(unittest.TestCase):
         self.assertNotEqual(a, event_uid(-100, 124, '+79775179200'))
         self.assertNotEqual(a, event_uid(-101, 123, '+79775179200'))
 
+    def test_minimal_requests_and_statuses(self):
+        for value in ('89775179200', '+7 (977) 517-92-00',
+                      '8 977 517 92 00.', '89775179200 Борис',
+                      'Борис 89775179200'):
+            with self.subTest(value=value):
+                self.assertEqual(classify_message(value).kind, 'new_request')
+        for value in ('89775179200 привет', '89775179200 новый номер',
+                      '89775179200 перезвонить', '89775179200 отказ'):
+            with self.subTest(value=value):
+                self.assertNotEqual(classify_message(value).kind, 'new_request')
+
+    def test_stress_10000_mixed_messages_without_exceptions(self):
+        for i in range(10000):
+            phone = f'89{i:09d}'
+            kind = i % 4
+            message = (phone if kind == 0 else
+                       phone + ' Иван' if kind == 1 else
+                       phone + ' ремонт кухни' if kind == 2 else
+                       phone + ' недозвон')
+            decision = classify_message(message)
+            self.assertEqual(decision.kind, 'status_update' if kind == 3 else 'new_request')
+
 
 if __name__ == '__main__':
     unittest.main()

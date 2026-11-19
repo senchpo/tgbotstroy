@@ -62,6 +62,15 @@ def classify_message(text: str) -> Decision:
         return Decision('status_update', 'known_status_phrase', phones)
     if request:
         return Decision('new_request', 'phone_and_work_intent', phones)
+    # Partners sometimes send only a phone number, without a name or job details.
+    # Do not interpret additional conversation as a lead merely because it has a phone.
+    remainder = PHONE_RE.sub(' ', text)
+    remainder = re.sub(r'[\s.,;:()\[\]{}\-–—/+]+', '', remainder)
+    if not remainder:
+        return Decision('new_request', 'phone_only', phones)
+    if re.fullmatch(r'[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){0,2}[.!\s]*',
+                    PHONE_RE.sub(' ', text).strip()):
+        return Decision('new_request', 'phone_and_name', phones)
     return Decision('ambiguous', 'phone_without_work_intent', phones)
 
 
