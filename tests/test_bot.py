@@ -176,6 +176,42 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(fields['UF_CRM_1776153852'], 'tg_unique')
         self.assertNotIn('TYPE_ID', fields)
 
+    def test_lead_title_and_comment_preserve_original_telegram_message(self):
+        original = '89775179200 Борис. М Крылатское с/у плиточные работы. Оп Любовь'
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'find_contact_by_phone', return_value=None), \
+             patch.object(bot, 'bitrix_post', side_effect=[
+                 {'result': 4440}, {'result': 5610},
+                 {'result': {'COMMENTS': original}},
+             ]) as post, patch.object(bot.time, 'sleep'):
+            lead_id, status, _ = bot.send_to_bitrix({
+                'phone': '89775179200', 'name': 'Борис',
+                'address': 'м. Крылатское', 'work_volume': 'плиточные работы',
+                'raw_text': original, 'request_uid': 'tg_456',
+            }, 'OTHER', 'Telegram', 'Общая группа')
+        self.assertEqual((lead_id, status), (5610, 'ok'))
+        contact_fields = post.call_args_list[0].args[1]['fields']
+        lead_fields = post.call_args_list[1].args[1]['fields']
+        self.assertEqual(contact_fields['COMMENTS'], original)
+        self.assertEqual(lead_fields['COMMENTS'], original)
+        self.assertEqual(lead_fields['TITLE'], 'Ремонт | +79775179200 | Борис')
+        self.assertEqual(lead_fields['UF_CRM_1776153852'], 'tg_456')
+
+    def test_phone_only_title_and_comment_without_missing_fields(self):
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'find_contact_by_phone', return_value=42), \
+             patch.object(bot, 'bitrix_post', side_effect=[
+                 {'result': 321}, {'result': {'COMMENTS': '89775179200'}}
+             ]) as post, patch.object(bot.time, 'sleep'):
+            lead_id, status, _ = bot.send_to_bitrix({
+                'phone': '89775179200', 'name': 'Не указано',
+                'raw_text': '89775179200',
+            }, 'OTHER', 'Telegram', 'Личные')
+        self.assertEqual((lead_id, status), (321, 'ok'))
+        fields = post.call_args_list[0].args[1]['fields']
+        self.assertEqual(fields['TITLE'], 'Ремонт | +79775179200 | Не указано')
+        self.assertEqual(fields['COMMENTS'], '89775179200')
+
     def test_duplicate_lookup_failure_aborts_creation(self):
         with patch.object(bot, 'bitrix_post', return_value={}), \
              self.assertRaisesRegex(RuntimeError, 'Не удалось проверить'):

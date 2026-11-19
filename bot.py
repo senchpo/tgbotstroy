@@ -486,9 +486,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
     phone    = data.get('phone', '').strip()
     name     = data.get('name', 'Не указано').strip()
     address  = data.get('address', 'Не указано').strip()
-    volume   = data.get('work_volume', 'Не указано').strip()
-    deadline = data.get('deadline', 'Не указано').strip()
-    comment  = data.get('comment', 'Не указано').strip()
     category = data.get('category', '').strip()
     raw_text = data.get('raw_text', '')
     request_uid = data.get('request_uid', '')
@@ -512,21 +509,11 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             return None, "duplicate", category
 
         contact_id = find_contact_by_phone(phone_norm)
-        title   = f"Ремонт | {name} | {address[:40]}"
+        title = f"Ремонт | {phone_norm} | {name}"
 
-        # ── КОММЕНТАРИЙ (без строк Источник и Чат) ───
-        comments = (
-            f"Имя: {name}\n"
-            f"Телефон: {phone_norm}\n"
-            f"Адрес: {address}\n"
-            f"Объём: {volume}\n"
-            f"Срок: {deadline}\n"
-            f"Тип: {category}\n"
-            f"Доп. инфо: {comment}\n"
-            f"Telegram request UID: {request_uid}\n"
-            f"---\n"
-            f"Оригинал:\n{raw_text}"
-        )
+        # Keep the original Telegram message intact. The request UID is stored
+        # separately in the CRM field, not mixed into customer-facing comments.
+        comments = raw_text if raw_text.strip() else f"{name}\n{phone_norm}"
 
         print('📝 Подготовлен комментарий к CRM без вывода персональных данных')
 
@@ -559,7 +546,8 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         }
 
         # TYPE_ID is not available in this portal's crm.lead.fields.
-        # The repair category is preserved in COMMENTS, not an invalid field.
+        # TYPE_ID is unavailable in this portal; do not inject parsed metadata
+        # into COMMENTS, which must match the original Telegram message.
         if request_uid:
             lead_fields[REQUEST_UID_FIELD] = request_uid
 
