@@ -15,10 +15,11 @@ REQUEST_WORDS = (
     'штукатур', 'студи', 'электрик', 'сантехник', 'столешниц',
     'помещен', 'офис', 'под ключ', 'новострой', 'вторичк',
     'заявка', 'замер', 'смета', 'кв.м', 'м2', 'кв ', 'кап ',
+    'стен', 'потолк', 'обои', 'обоев', 'поклейк', 'косм ',
 )
 
 STATUS_PHRASES = (
-    'не дозвони', 'недозвон', 'перезвон', 'не актуал', 'неактуал',
+    'не дозвони', 'недозвон', 'не актуал', 'неактуал',
     'отказ', 'смета отправ', 'выезд состоял', 'замер состоял',
     'договор подпис', 'в работе', 'закрыт', 'оплат', 'сделка',
     'отложен', 'поставил', 'назначили дело',
@@ -27,6 +28,11 @@ STATUS_PHRASES = (
 NEW_REQUEST_PHRASES = (
     'новая заявка', 'новый клиент', 'новое обращение',
     'просит ремонт', 'нужен ремонт', 'нужно сделать', 'хочет ремонт',
+)
+
+CUSTOMER_INTENT_PHRASES = (
+    'просит', 'попросил', 'попросила', 'хочет', 'интересует',
+    'интересовалась', 'интересовался', 'нужно', 'надо',
 )
 
 
@@ -55,11 +61,16 @@ def classify_message(text: str) -> Decision:
     value = text.casefold()
     request = any(x in value for x in REQUEST_WORDS)
     status = any(x in value for x in STATUS_PHRASES)
+    followup = 'перезвон' in value
     explicit_new = any(x in value for x in NEW_REQUEST_PHRASES)
     if explicit_new and request:
         return Decision('new_request', 'explicit_new_request', phones)
     if status:
         return Decision('status_update', 'known_status_phrase', phones)
+    # An initial customer briefing often says "просит ... перезвонить".
+    # A standalone "ремонт кухни, перезвонить" is still a status/task.
+    if followup and not (request and any(x in value for x in CUSTOMER_INTENT_PHRASES)):
+        return Decision('status_update', 'followup_without_new_intent', phones)
     if request:
         return Decision('new_request', 'phone_and_work_intent', phones)
     # Partners sometimes send only a phone number, without a name or job details.

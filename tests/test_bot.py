@@ -67,6 +67,28 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[1], 'OTHER')
         self.assertEqual(bot._delivery_queue.ready(), [])
 
+    def test_victor_and_service_group_requests_are_delivered(self):
+        samples = (
+            ('Заявки Виктор', '+79539777262 стены/потолки/обои в 2к кв'),
+            ('Отдел сервиса и мелкого ремонта',
+             'Валентина +7 980 558-73-66\nМытищи\n'
+             'втор косм 300-350кв по стенам, частичная подготовка под обои\n'
+             'просит скинуть смс, куда можно будет перезвонить'),
+        )
+        for index, (title, raw) in enumerate(samples):
+            with self.subTest(title=title):
+                message = types.SimpleNamespace(
+                    chat=types.SimpleNamespace(id=-1000 - index, title=title),
+                    message_id=42 + index, text=raw,
+                    from_user=types.SimpleNamespace(is_bot=False),
+                )
+                with patch.object(bot, 'send_to_bitrix', return_value=(999, 'ok', '')) as send, \
+                     patch.object(bot, 'set_reaction'):
+                    bot.handle_message(message)
+                self.assertEqual(send.call_count, 1)
+                self.assertEqual(send.call_args.args[0]['raw_text'], raw)
+                self.assertEqual(bot._delivery_queue.ready(), [])
+
     def test_multiline_contact_details_without_ai(self):
         raw = ('Замер на завтра 19.11\nГерман +7 916 683-21-25\n'
                'Москва Пятницкая улица, 8\nвтор кап 100кв\nбез проживания')
