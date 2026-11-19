@@ -30,6 +30,23 @@ NEW_REQUEST_PHRASES = (
     'просит ремонт', 'нужен ремонт', 'нужно сделать', 'хочет ремонт',
 )
 
+# Only a small subset of uncertain, phone-bearing messages merits a manual
+# decision. Brief chat, number exchanges and call statuses stay out of DMs.
+REVIEW_HINTS = (
+    'москв', 'мытищ', 'красногор', 'химк', 'балаших', 'пгт',
+    'адрес', 'улиц', 'проспект', 'шоссе', 'метро', 'район',
+    'посел', 'деревн', 'ламинат', 'двер',
+    'окна', 'окон', 'укладк', 'объект', 'перегород', 'шпаклев',
+    'утеплен', 'квадрат', 'площад', 'мастер', 'материал',
+    'срок', 'стоимост', 'расчёт', 'расчет', 'консультац',
+)
+REVIEW_EXCLUSIONS = (
+    'не берёт', 'не берет', 'не отвечает', 'не дозвони',
+    'недоступен', 'звонил', 'звонила', 'новый номер',
+    'всё хорошо', 'все хорошо', 'привет', 'спасибо',
+    'созвон', 'не актуал', 'неактуал',
+)
+
 CUSTOMER_INTENT_PHRASES = (
     'просит', 'попросил', 'попросила', 'хочет', 'интересует',
     'интересовалась', 'интересовался', 'нужно', 'надо',
@@ -83,6 +100,22 @@ def classify_message(text: str) -> Decision:
                     PHONE_RE.sub(' ', text).strip()):
         return Decision('new_request', 'phone_and_name', phones)
     return Decision('ambiguous', 'phone_without_work_intent', phones)
+
+
+def needs_manual_review(text: str, decision: Decision | None = None) -> bool:
+    """Escalate plausible unrecognized leads, not ordinary phone chatter."""
+    decision = decision or classify_message(text)
+    if decision.kind != 'ambiguous' or not decision.phones:
+        return False
+    remainder = PHONE_RE.sub(' ', text)
+    lowered = remainder.casefold()
+    if any(marker in lowered for marker in REVIEW_EXCLUSIONS):
+        return False
+    words = re.findall(r'[а-яёa-z]{3,}', lowered)
+    if len(words) < 2:
+        return False
+    return (any(hint in lowered for hint in REVIEW_HINTS)
+            or bool(re.search(r'\b[мг]\s*\.\s*[а-яё]+', lowered)))
 
 
 def event_uid(chat_id: int, message_id: int, phone: str) -> str:

@@ -53,6 +53,40 @@ diagnostic `/test`, `/cache`, `/sources` commands. Without this setting those
 commands are disabled. Keep `USE_AI_PARSER=false` unless third-party AI data
 processing is explicitly intended.
 
+### Manual review of uncertain Telegram requests
+
+Clear repair requests (including phone-only messages) go to Bitrix24 without
+manual approval. Obvious phone-bearing statuses and ordinary chat are ignored.
+Only *plausible but unrecognized* phone-bearing requests are stored in a
+`manual_review` SQLite table, and the designated admin receives a private
+Telegram message with **Confirm** / **Reject** inline buttons. The table is on
+the same persistent `QUEUE_DB_PATH` volume as the delivery queue.
+
+- Set `REVIEW_ADMIN_CHAT_ID` to **one trusted person's Telegram numeric ID**;
+  this user receives customer names, phone numbers, and raw chat text.
+  Alternatively, if `ADMIN_USER_IDS` contains exactly one ID, that ID is used.
+- The admin must send `/start` to the bot in a private Telegram chat before
+  Telegram permits the bot to send private notifications. `/myid` in that chat
+  returns the admin's numeric ID for configuration.
+- Without either configuration, doubtful requests **remain stored** but no
+  private notification is sent. Once the ID is set and the bot restarts, pending
+  notifications are retried automatically.
+- Confirming atomically moves a message to the normal Bitrix retry queue, and
+  the existing Telegram UID deduplication applies. If Bitrix is unavailable,
+  the confirmation stays in the persistent queue and retries automatically.
+  Rejecting keeps only review metadata, without the original text. Repeated
+  button presses never create additional CRM leads.
+- Failed private notifications retry with backoff. Very rarely, a crash after
+  Telegram accepts a notification but before its receipt is journaled can
+  create two notification messages. Only the first confirmation is applied.
+- The review classifier intentionally minimizes interruptions; it cannot
+  detect every possible uncommon lead wording. Admins should periodically
+  reconcile Telegram messages with CRM to find remaining misses.
+
+Never set the review recipient to a shared group or an unverified Telegram ID.
+The review table may retain personal data until a decision is made; protect
+and back up the Railway volume accordingly.
+
 The pending queue contains original Telegram messages, including names and
 phone numbers, **until delivery succeeds**. Protect the volume with Railway
 access controls and backups. Never commit the SQLite file.
@@ -80,7 +114,9 @@ Run only with `TEST_BITRIX_URL` configured in a trusted test environment.
 Known limitations: the SQLite queue is durable only if backed by a mounted
 volume; Bitrix contact creation may succeed even if lead creation fails. Real
 CRM credentials and production messages are not used by
-the offline tests. No Railway deployment is made as part of these changes.
+the offline tests. A GitHub push can trigger an automatic Railway deployment
+when that branch is linked to the service; verify the live deployment
+separately before relying on new functionality.
 
 The field labelled `UF_CRM_REQUEST_UID` was confirmed by a **read-only** REST
 audit of the production portal on 2026-11-18 as `UF_CRM_1776153852` (string).
@@ -91,8 +127,9 @@ However, this lookup is not an atomic uniqueness constraint: simultaneous
 replicas, a network timeout during creation, or a crash between the lookup and
 write can still create duplicates. Exactly-once delivery is **not guaranteed**
 until a CRM-side atomic uniqueness guarantee or reconciliation workflow exists.
-The portal also does not expose `TYPE_ID` in `crm.lead.fields`; repair category
-remains in `COMMENTS` instead of being sent to an unsupported field.
+The portal also does not expose `TYPE_ID` in `crm.lead.fields`; that field is
+omitted. Lead and contact `COMMENTS` contain the original Telegram text only;
+parsed metadata is not appended to the comment.
 
 PII in routine logging has been reduced. Existing Railway historical logs are
 not modified or deleted by this patch.

@@ -12,6 +12,7 @@ from delivery_queue import DeliveryQueue
 fake_telebot = types.ModuleType('telebot')
 fake_bot = MagicMock()
 fake_bot.message_handler.side_effect = lambda **kwargs: (lambda function: function)
+fake_bot.callback_query_handler.side_effect = lambda **kwargs: (lambda function: function)
 fake_telebot.TeleBot = MagicMock(return_value=fake_bot)
 sys.modules.setdefault('telebot', fake_telebot)
 fake_requests = types.ModuleType('requests')
@@ -88,6 +89,110 @@ class ParsingTests(unittest.TestCase):
                 self.assertEqual(send.call_count, 1)
                 self.assertEqual(send.call_args.args[0]['raw_text'], raw)
                 self.assertEqual(bot._delivery_queue.ready(), [])
+
+    def test_ambiguous_request_is_reviewed_and_not_auto_sent(self):
+        message = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-1000, title='Заявки Виктор'),
+            message_id=44, text='Мария +7 916 123-45-67, Москва, нужен расчёт',
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'REVIEW_ADMIN_CHAT_ID', 123), \
+             patch.object(bot, 'send_review_notifications') as notify, \
+             patch.object(bot, 'send_to_bitrix') as send:
+            bot.handle_message(message)
+            bot.handle_message(message)
+        send.assert_not_called()
+        self.assertEqual(notify.call_count, 2)
+        reviews = bot._delivery_queue.reviews_to_notify()
+        self.assertEqual(len(reviews), 1)
+        self.assertIn('Мария', reviews[0][2])
+
+    def test_admin_is_notified_once_with_approval_buttons(self):
+        review_id = bot._delivery_queue.add_review(
+            -1000, 47, 'Партнёр', 'Ирина +79161234567, Москва, консультация')
+        fake_types = types.SimpleNamespace(
+            InlineKeyboardMarkup=MagicMock(return_value=MagicMock()),
+            InlineKeyboardButton=MagicMock(side_effect=lambda label, **kwargs:
+                                           (label, kwargs['callback_data'])),
+        )
+        with patch.object(bot, 'REVIEW_ADMIN_CHAT_ID', 123), \
+             patch.object(bot.telebot, 'types', fake_types, create=True), \
+             patch.object(bot.bot, 'send_message') as send:
+            bot.send_review_notifications()
+            bot.send_review_notifications()
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], 123)
+        self.assertIn('Ирина', send.call_args.args[1])
+        self.assertIn('Группа: Партнёр', send.call_args.args[1])
+        buttons = fake_types.InlineKeyboardButton.call_args_list
+        self.assertEqual([call.kwargs['callback_data'] for call in buttons],
+                         [f'rv:a:{review_id}', f'rv:r:{review_id}'])
+
+    def test_failed_admin_dm_remains_for_retry(self):
+        bot._delivery_queue.add_review(-1000, 48, 'Партнёр',
+                                       'Ирина +79161234567, Москва, консультация')
+        fake_types = types.SimpleNamespace(
+            InlineKeyboardMarkup=MagicMock(return_value=MagicMock()),
+            InlineKeyboardButton=MagicMock(return_value=MagicMock()),
+        )
+        with patch.object(bot, 'REVIEW_ADMIN_CHAT_ID', 123), \
+             patch.object(bot.telebot, 'types', fake_types, create=True), \
+             patch.object(bot.bot, 'send_message', side_effect=RuntimeError('failed')):
+            bot.send_review_notifications()
+        self.assertEqual(bot._delivery_queue.reviews_to_notify(), [])
+        with patch('delivery_queue.time.time', return_value=10**15):
+            self.assertEqual(len(bot._delivery_queue.reviews_to_notify()), 1)
+
+    def test_approval_is_authorized_queued_and_idempotent(self):
+        queue = bot._delivery_queue
+        review_id = queue.add_review(-1000, 44, 'Заявки Виктор',
+                                     'Мария +7 916 123-45-67, Москва, нужен расчёт')
+        event = types.SimpleNamespace(
+            id='callback', data=f'rv:a:{review_id}',
+            from_user=types.SimpleNamespace(id=123),
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=123), message_id=99),
+        )
+        with patch.object(bot, 'REVIEW_ADMIN_CHAT_ID', 123), \
+             patch.object(bot, 'process_queued_message', return_value=False) as process:
+            bot.handle_review_decision(event)
+            bot.handle_review_decision(event)
+        process.assert_called_once()
+        self.assertEqual(len(queue.ready()), 1)
+        self.assertTrue(DeliveryQueue(queue.path).is_review_approved(-1000, 44))
+
+    def test_rejected_and_unauthorized_requests_never_reach_crm(self):
+        queue = bot._delivery_queue
+        review_id = queue.add_review(-1000, 45, 'Партнёр',
+                                     'Ирина 89161234567, адрес Москва')
+        event = types.SimpleNamespace(
+            id='callback', data=f'rv:a:{review_id}',
+            from_user=types.SimpleNamespace(id=666),
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=123), message_id=100),
+        )
+        with patch.object(bot, 'REVIEW_ADMIN_CHAT_ID', 123), \
+             patch.object(bot, 'process_queued_message') as process:
+            bot.handle_review_decision(event)
+            self.assertEqual(len(queue.reviews_to_notify()), 1)
+            event.from_user.id = 123
+            event.data = f'rv:r:{review_id}'
+            bot.handle_review_decision(event)
+        process.assert_not_called()
+        self.assertEqual(queue.ready(), [])
+        self.assertEqual(queue.reviews_to_notify(), [])
+
+    def test_approved_ambiguous_message_retries_without_reclassification(self):
+        queue = bot._delivery_queue
+        review_id = queue.add_review(-1000, 46, 'Заявки Виктор',
+                                     'Мария +7 916 123-45-67, Москва, нужен расчёт')
+        self.assertTrue(queue.decide_review(review_id, True, 123)[0])
+        with patch.object(bot, 'send_to_bitrix', return_value=(321, 'ok', '')) as send, \
+             patch.object(bot, 'set_reaction'):
+            bot.retry_pending()
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(queue.ready(), [])
+        self.assertFalse(DeliveryQueue(queue.path).is_review_approved(-1000, 46))
 
     def test_multiline_contact_details_without_ai(self):
         raw = ('Замер на завтра 19.11\nГерман +7 916 683-21-25\n'

@@ -5,7 +5,7 @@ import os
 import re
 import threading
 from datetime import datetime
-from intake import classify_message, event_uid
+from intake import classify_message, event_uid, needs_manual_review
 from delivery_queue import DeliveryQueue
 
 # ============================================
@@ -18,6 +18,12 @@ USE_AI_PARSER = os.environ.get('USE_AI_PARSER', 'false').lower() == 'true'
 QUEUE_DB_PATH = os.environ.get('QUEUE_DB_PATH', 'telegram_pending.sqlite3')
 ADMIN_USER_IDS = {int(x) for x in os.environ.get('ADMIN_USER_IDS', '').split(',')
                   if x.strip().isdigit()}
+_review_admin_setting = os.environ.get('REVIEW_ADMIN_CHAT_ID', '').strip()
+# Only a single, explicitly selected Telegram account receives customer PII.
+REVIEW_ADMIN_CHAT_ID = (int(_review_admin_setting)
+                        if _review_admin_setting.isdigit()
+                        else next(iter(ADMIN_USER_IDS)) if len(ADMIN_USER_IDS) == 1
+                        else None)
 
 # ============================================
 # БЛОКИРОВКИ ПО ТЕЛЕФОНУ
@@ -600,6 +606,96 @@ def cmd_start(msg):
     bot.reply_to(msg, "✅ Бот активен.")
 
 
+@bot.message_handler(commands=['myid'])
+def cmd_myid(msg):
+    if getattr(msg.chat, 'type', None) == 'private':
+        bot.reply_to(msg, f"Ваш Telegram ID: {msg.from_user.id}")
+
+
+def send_review_notifications():
+    """Notify one verified admin; failed Telegram DMs remain retryable."""
+    if REVIEW_ADMIN_CHAT_ID is None:
+        return
+    from telebot import types
+    with _queue_mutex:
+        for review_id, chat_title, body in get_delivery_queue().reviews_to_notify():
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.row(
+                types.InlineKeyboardButton('✅ Подтвердить',
+                                           callback_data=f'rv:a:{review_id}'),
+                types.InlineKeyboardButton('❌ Отклонить',
+                                           callback_data=f'rv:r:{review_id}'),
+            )
+            short_body = body if len(body) <= 3000 else body[:3000] + '\n…'
+            message = (f'🤔 Возможно, новая заявка (проверка №{review_id})\n'
+                       f'Группа: {chat_title}\n\n{short_body}')
+            try:
+                bot.send_message(REVIEW_ADMIN_CHAT_ID, message,
+                                 reply_markup=keyboard)
+                get_delivery_queue().review_notified(review_id)
+                print(f'✅ Отправлена проверка заявки №{review_id}')
+            except Exception as exc:
+                get_delivery_queue().review_notify_failed(review_id)
+                print(f'⚠️ Не удалось отправить проверку №{review_id}: '
+                      f'{type(exc).__name__}')
+
+
+@bot.callback_query_handler(func=lambda call: bool(getattr(call, 'data', '')
+                                                   and call.data.startswith('rv:')))
+def handle_review_decision(call):
+    """Use only authenticated private callbacks; never trust callback payloads."""
+    def answer(message: str):
+        try:
+            bot.answer_callback_query(call.id, message)
+        except Exception:
+            pass
+
+    if (REVIEW_ADMIN_CHAT_ID is None
+            or getattr(call.from_user, 'id', None) != REVIEW_ADMIN_CHAT_ID
+            or getattr(getattr(call.message, 'chat', None), 'id', None)
+            != REVIEW_ADMIN_CHAT_ID):
+        answer('Нет доступа')
+        return
+    parts = (call.data or '').split(':')
+    if len(parts) != 3 or parts[0] != 'rv' or parts[1] not in ('a', 'r') \
+            or not parts[2].isdigit():
+        answer('Некорректная команда')
+        return
+
+    approve = parts[1] == 'a'
+    with _queue_mutex:
+        changed, row = get_delivery_queue().decide_review(
+            int(parts[2]), approve, REVIEW_ADMIN_CHAT_ID)
+        if not changed:
+            answer('Решение уже принято или заявка не найдена')
+            return
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id,
+                                          call.message.message_id,
+                                          reply_markup=None)
+        except Exception:
+            pass
+        if not approve:
+            answer('Заявка отклонена')
+            return
+        answer('Подтверждено: отправляем в CRM')
+        chat_id, message_id, chat_title, body, _ = row
+        try:
+            success = process_queued_message(chat_id, message_id,
+                                             chat_title, body)
+        except Exception as exc:
+            print(f'⚠️ Ошибка отправки подтверждённой заявки: '
+                  f'{type(exc).__name__}')
+            success = False
+        try:
+            bot.send_message(REVIEW_ADMIN_CHAT_ID,
+                             ('✅ Подтверждённая заявка обработана в CRM.' if success
+                              else '⚠️ Заявка сохранена в очереди CRM и будет '
+                                   'отправлена повторно автоматически.'))
+        except Exception:
+            pass
+
+
 @bot.message_handler(commands=['test'])
 def cmd_test(msg):
     if not ADMIN_USER_IDS or getattr(msg.from_user, 'id', None) not in ADMIN_USER_IDS:
@@ -644,6 +740,14 @@ def handle_message(message):
     # (e.g. "с/у плиточные работы") or omit repair keywords altogether.
     decision = classify_message(text)
     if decision.kind != 'new_request':
+        if needs_manual_review(text, decision):
+            chat_title = getattr(message.chat, 'title', None) or 'Личные'
+            with _queue_mutex:
+                get_delivery_queue().add_review(message.chat.id,
+                                                message.message_id,
+                                                chat_title, text)
+                send_review_notifications()
+            return
         print(f'ℹ️ Пропущено сообщение: {decision.kind}/{decision.reason} '
               f'chat={message.chat.id} msg={message.message_id}')
         return
@@ -658,7 +762,8 @@ def handle_message(message):
 def process_queued_message(chat_id: int, message_id: int, chat_title: str,
                            text: str) -> bool:
     """Return True only after every phone in the Telegram event is handled."""
-    if classify_message(text).kind != 'new_request':
+    if (classify_message(text).kind != 'new_request'
+            and not get_delivery_queue().is_review_approved(chat_id, message_id)):
         get_delivery_queue().complete(chat_id, message_id)
         return True
 
@@ -724,6 +829,7 @@ def retry_loop():
     while True:
         try:
             retry_pending()
+            send_review_notifications()
         except Exception as exc:
             # Do not permanently stop retries on an incidental SQLite/CRM error.
             print(f'⚠️ Цикл повторов: {type(exc).__name__}')
@@ -735,6 +841,9 @@ def retry_loop():
 # ============================================
 if __name__ == "__main__":
     print("✅ Бот стартует...")
+    if REVIEW_ADMIN_CHAT_ID is None:
+        print('⚠️ Ручная проверка: задайте REVIEW_ADMIN_CHAT_ID '
+              'или один ADMIN_USER_IDS; сомнительные заявки сохраняются.')
     threading.Thread(target=retry_loop, daemon=True).start()
     try:
         # Preserve updates received while the service was offline.

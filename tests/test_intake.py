@@ -1,6 +1,6 @@
 import unittest
 
-from intake import classify_message, event_uid, phones_in
+from intake import classify_message, event_uid, phones_in, needs_manual_review
 
 
 class IntakeClassifierTests(unittest.TestCase):
@@ -87,6 +87,26 @@ class IntakeClassifierTests(unittest.TestCase):
                       '89775179200 перезвонить', '89775179200 отказ'):
             with self.subTest(value=value):
                 self.assertNotEqual(classify_message(value).kind, 'new_request')
+
+    def test_only_plausible_ambiguous_leads_are_escalated(self):
+        for message in (
+            'Мария +7 916 123-45-67, Москва, нужен расчёт',
+            'Анна 89161234567, м. Молодёжная, консультация',
+            '89161234567 установка ламината, сроки и стоимость',
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(classify_message(message).kind, 'ambiguous')
+                self.assertTrue(needs_manual_review(message))
+        for message in (
+            '89161234567 привет',
+            '89161234567 новый номер',
+            '89161234567 не берёт трубку',
+            '89161234567 ремонт кухни, перезвонить',
+            '89161234567',
+            'Всем привет без номера',
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(needs_manual_review(message))
 
     def test_stress_10000_mixed_messages_without_exceptions(self):
         for i in range(10000):
