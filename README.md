@@ -34,6 +34,29 @@ fails, the local parser remains the fallback.
 
 ## Checks before deployment
 
+### Reliable delivery and Railway configuration
+
+New requests are journaled in a SQLite `pending` table *before* attempting
+CRM writes. Transient failures are retried with bounded exponential backoff
+(10 seconds to 1 hour); successful events are removed. On restart, the retry
+worker resumes pending events. Each Telegram event/phone has a deterministic
+UID, so a successful partial delivery will be recognized on replay.
+
+**Important:** configure `QUEUE_DB_PATH` on a **persistent Railway volume**,
+e.g. `/data/telegram_pending.sqlite3`. The default relative path is suitable
+for local testing but may disappear on Railway redeploys. A single bot replica
+is assumed: SQLite and the CRM UID lookup are not a distributed lock. Ensure
+only one polling process owns the Telegram bot token.
+
+Set `ADMIN_USER_IDS` to comma-separated Telegram numeric user IDs for the
+diagnostic `/test`, `/cache`, `/sources` commands. Without this setting those
+commands are disabled. Keep `USE_AI_PARSER=false` unless third-party AI data
+processing is explicitly intended.
+
+The pending queue contains original Telegram messages, including names and
+phone numbers, **until delivery succeeds**. Protect the volume with Railway
+access controls and backups. Never commit the SQLite file.
+
 Run offline tests without a Telegram token or Bitrix24 credentials:
 
 ```bash
@@ -54,9 +77,9 @@ verifies their linkage and UID, and deletes only the IDs it created in a
 `finally` block. If cleanup fails, it reports the exact IDs for manual
 recovery. It is **never** invoked by offline unit tests or normal bot startup.
 Run only with `TEST_BITRIX_URL` configured in a trusted test environment.
-Known limitations: in-memory duplicate cache is not persistent, the bot has no
-durable processing queue, and Bitrix contact creation may succeed even if lead
-creation fails. Real CRM credentials and production messages are not used by
+Known limitations: the SQLite queue is durable only if backed by a mounted
+volume; Bitrix contact creation may succeed even if lead creation fails. Real
+CRM credentials and production messages are not used by
 the offline tests. No Railway deployment is made as part of these changes.
 
 The field labelled `UF_CRM_REQUEST_UID` was confirmed by a **read-only** REST
@@ -67,7 +90,7 @@ receive new leads without being blocked by phone-only deduplication.
 However, this lookup is not an atomic uniqueness constraint: simultaneous
 replicas, a network timeout during creation, or a crash between the lookup and
 write can still create duplicates. Exactly-once delivery is **not guaranteed**
-until a durable outbox/reconciliation workflow and integration test exist.
+until a CRM-side atomic uniqueness guarantee or reconciliation workflow exists.
 The portal also does not expose `TYPE_ID` in `crm.lead.fields`; repair category
 remains in `COMMENTS` instead of being sent to an unsupported field.
 
