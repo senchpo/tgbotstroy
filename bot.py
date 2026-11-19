@@ -6,6 +6,7 @@ import re
 import threading
 from datetime import datetime
 from intake import classify_message, event_uid
+from delivery_queue import DeliveryQueue
 
 # ============================================
 # КОНФИГ
@@ -14,6 +15,9 @@ TOKEN        = os.environ.get("TOKEN", "")
 BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 USE_AI_PARSER = os.environ.get('USE_AI_PARSER', 'false').lower() == 'true'
+QUEUE_DB_PATH = os.environ.get('QUEUE_DB_PATH', 'telegram_pending.sqlite3')
+ADMIN_USER_IDS = {int(x) for x in os.environ.get('ADMIN_USER_IDS', '').split(',')
+                  if x.strip().isdigit()}
 
 # ============================================
 # БЛОКИРОВКИ ПО ТЕЛЕФОНУ
@@ -186,8 +190,17 @@ def parse_lead_fallback(text: str) -> list[dict]:
         })
     return leads
 
-_processed_msgs: set[str] = set()
+_processed_msgs: set[str] = set()  # compatibility with older tests
 _processed_msgs_mutex = threading.Lock()
+_queue_mutex = threading.RLock()
+_delivery_queue = None
+
+
+def get_delivery_queue():
+    global _delivery_queue
+    if _delivery_queue is None:
+        _delivery_queue = DeliveryQueue(QUEUE_DB_PATH)
+    return _delivery_queue
 
 
 # ============================================
@@ -240,7 +253,7 @@ def get_type_id(category: str) -> str | None:
 
 
 def bitrix_post(method: str, payload: dict) -> dict:
-    url = BITRIX_URL + method
+    url = BITRIX_URL.rstrip('/') + '/' + method
     try:
         resp = requests.post(url, json=payload, timeout=15)
         data = resp.json()
@@ -600,6 +613,8 @@ def cmd_start(msg):
 
 @bot.message_handler(commands=['test'])
 def cmd_test(msg):
+    if not ADMIN_USER_IDS or getattr(msg.from_user, 'id', None) not in ADMIN_USER_IDS:
+        return
     r = bitrix_post("crm.lead.list", {"filter": {"ID": "1"}, "select": ["ID"]})
     if isinstance(r, dict) and 'result' in r:
         bot.reply_to(msg, "✅ Битрикс доступен!")
@@ -609,6 +624,8 @@ def cmd_test(msg):
 
 @bot.message_handler(commands=['cache'])
 def cmd_cache(msg):
+    if not ADMIN_USER_IDS or getattr(msg.from_user, 'id', None) not in ADMIN_USER_IDS:
+        return
     with _known_phones_mutex:
         phones = sorted(_known_phones)
     text = f"📋 Кэш ({len(phones)}):\n" + "\n".join(phones[-20:]) if phones else "📋 Кэш пуст"
@@ -617,6 +634,8 @@ def cmd_cache(msg):
 
 @bot.message_handler(commands=['sources'])
 def cmd_sources(msg):
+    if not ADMIN_USER_IDS or getattr(msg.from_user, 'id', None) not in ADMIN_USER_IDS:
+        return
     r = bitrix_post("crm.status.list", {"filter": {"ENTITY_ID": "SOURCE"}})
     items = r.get("result", [])
     text  = "📋 Источники в Битрикс:\n\n"
@@ -627,15 +646,6 @@ def cmd_sources(msg):
 
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def handle_message(message):
-    msg_key = f"{message.chat.id}_{message.message_id}"
-    with _processed_msgs_mutex:
-        if msg_key in _processed_msgs:
-            print(f"⚠️ Уже обработано: {msg_key}")
-            return
-        _processed_msgs.add(msg_key)
-        if len(_processed_msgs) > 2000:
-            _processed_msgs.clear()
-
     text = message.text or ""
     if not text or text.startswith('/') or len(text) < 10:
         return
@@ -649,12 +659,25 @@ def handle_message(message):
               f'chat={message.chat.id} msg={message.message_id}')
         return
 
-    chat_title             = getattr(message.chat, 'title', None) or "Личные"
+    chat_title = getattr(message.chat, 'title', None) or 'Личные'
+    # Journal before Bitrix writes: a failure must not silently consume the update.
+    with _queue_mutex:
+        get_delivery_queue().enqueue(message.chat.id, message.message_id, chat_title, text)
+        process_queued_message(message.chat.id, message.message_id, chat_title, text)
+
+
+def process_queued_message(chat_id: int, message_id: int, chat_title: str,
+                           text: str) -> bool:
+    """Return True only after every phone in the Telegram event is handled."""
+    if classify_message(text).kind != 'new_request':
+        get_delivery_queue().complete(chat_id, message_id)
+        return True
+
     source_id, source_name = get_source_from_message(chat_title, text)
 
     print(f"\n{'='*50}")
     print(f"📨 Чат: '{chat_title}' | Источник: {source_name} [{source_id}]")
-    print(f'📝 Новая заявка: chat={message.chat.id} msg={message.message_id}')
+    print(f'📝 Новая заявка: chat={chat_id} msg={message_id}')
 
     leads = parse_lead_ai(text) if USE_AI_PARSER and GROQ_API_KEY else []
     actual_phones = set(extract_phones(text))
@@ -667,11 +690,10 @@ def handle_message(message):
     ok = dup = skip = 0
 
     for lead in leads:
-        lead['request_uid'] = event_uid(message.chat.id, message.message_id,
+        lead['request_uid'] = event_uid(chat_id, message_id,
                                         normalize_phone(lead.get('phone', '')))
         lid, status, cat = send_to_bitrix(lead, source_id, source_name, chat_title)
         n = lead.get('name', '—')
-        p = lead.get('phone', '—')
 
         if status == "ok":
             ok += 1
@@ -683,16 +705,36 @@ def handle_message(message):
             skip += 1
             print(f"⚠️ Нет телефона: {n}")
         else:
-            print(f"❌ Ошибка: {n} | {p}")
+            print('❌ Не удалось доставить заявку в CRM')
 
-    if ok:
-        set_reaction(message.chat.id, message.message_id, "✅")
-    elif dup:
-        set_reaction(message.chat.id, message.message_id, "❌")
-    elif skip:
-        set_reaction(message.chat.id, message.message_id, "🤔")
+    all_handled = bool(leads) and ok + dup == len(leads)
+    if all_handled:
+        get_delivery_queue().complete(chat_id, message_id)
+        if ok:
+            set_reaction(chat_id, message_id, "✅")
+        elif dup:
+            set_reaction(chat_id, message_id, "❌")
     else:
-        print(f'❌ Заявка не создана: chat={message.chat.id} msg={message.message_id}')
+        get_delivery_queue().defer(chat_id, message_id)
+        print(f'⚠️ Заявка ожидает повтора: chat={chat_id} msg={message_id}')
+    return all_handled
+
+
+def retry_pending():
+    """Try due events, including those journaled before the last restart."""
+    with _queue_mutex:
+        for chat_id, message_id, chat_title, text in get_delivery_queue().ready():
+            try:
+                process_queued_message(chat_id, message_id, chat_title, text)
+            except Exception as exc:
+                print(f'⚠️ Повтор заявки отложен: {type(exc).__name__}')
+                get_delivery_queue().defer(chat_id, message_id)
+
+
+def retry_loop():
+    while True:
+        retry_pending()
+        time.sleep(20)
 
 
 # ============================================
@@ -700,6 +742,7 @@ def handle_message(message):
 # ============================================
 if __name__ == "__main__":
     print("✅ Бот стартует...")
+    threading.Thread(target=retry_loop, daemon=True).start()
     try:
         # Preserve updates received while the service was offline.
         bot.delete_webhook(drop_pending_updates=False)
