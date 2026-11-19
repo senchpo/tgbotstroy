@@ -3,7 +3,9 @@ import os
 import sys
 import types
 import unittest
+import tempfile
 from unittest.mock import MagicMock, patch
+from delivery_queue import DeliveryQueue
 
 
 # Test parsing and routing without a live Telegram token or network calls.
@@ -26,6 +28,13 @@ class ParsingTests(unittest.TestCase):
         bot._known_phones.clear()
         bot._processed_msgs.clear()
         bot._phone_locks.clear()
+        self.queue_dir = tempfile.TemporaryDirectory()
+        self.previous_queue = bot._delivery_queue
+        bot._delivery_queue = DeliveryQueue(os.path.join(self.queue_dir.name, 'pending.sqlite3'))
+
+    def tearDown(self):
+        bot._delivery_queue = self.previous_queue
+        self.queue_dir.cleanup()
 
     def test_short_message_phone_and_fallback(self):
         self.assertEqual(bot.extract_phones(self.SAMPLE), ['+79775179200'])
@@ -84,6 +93,26 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[0]['phone'], '+79775179200')
         self.assertEqual(send.call_args.args[1], 'UC_0RYYOV')
         reaction.assert_called_once()
+
+    def test_failed_delivery_replays_from_persistent_queue(self):
+        message = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-124, title='Общая группа'),
+            message_id=56, text=self.SAMPLE,
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = DeliveryQueue(os.path.join(tmp, 'retries.sqlite3'))
+            with patch.object(bot, '_delivery_queue', queue), \
+                 patch.object(bot, 'send_to_bitrix', side_effect=[
+                     (None, 'bitrix_error', ''), (123, 'ok', '')]) as send, \
+                 patch.object(bot, 'set_reaction') as reaction:
+                bot.handle_message(message)
+                self.assertEqual(queue.ready(), [])  # backoff, not discarded
+                with patch('delivery_queue.time.time', return_value=10**15):
+                    bot.retry_pending()
+                self.assertEqual(DeliveryQueue(queue.path).ready(), [])
+                self.assertEqual(send.call_count, 2)
+                reaction.assert_called_once()
 
     def test_failed_lead_does_not_enter_duplicate_cache(self):
         with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
