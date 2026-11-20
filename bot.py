@@ -287,17 +287,23 @@ def bitrix_post(method: str, payload: dict) -> dict:
 # ============================================
 # ПРОВЕРКА ДУБЛЕЙ
 # ============================================
-def check_duplicate(phone_norm: str) -> bool:
-    if is_phone_known(phone_norm):
-        print(f"⛔ [КЭШ] Дубль: {phone_norm}")
-        return True
+def duplicate_phone_values(phone_norm: str) -> list[str]:
+    """Look for both Russian 7/8 prefixes and formatted +7 CRM entries."""
+    digits = re.sub(r'\D', '', phone_norm)
+    if len(digits) == 11 and digits.startswith('7'):
+        return [digits, '8' + digits[1:], '+' + digits]
+    return [digits]
 
-    phone_digits = re.sub(r'\D', '', phone_norm)
+
+def check_duplicate(phone_norm: str) -> bool:
+    # The local cache is diagnostic only; CRM may change while the bot runs.
+    # Check Bitrix for every new Telegram event to avoid stale decisions.
+    values = duplicate_phone_values(phone_norm)
     print('🔍 Проверяем дубль по номеру')
 
     resp = bitrix_post("crm.duplicate.findByComm", {
         "type":        "PHONE",
-        "values":      [phone_digits],
+        "values":      values,
         "entity_type": "CONTACT",
     })
     if 'result' not in resp or 'error' in resp:
@@ -313,7 +319,7 @@ def check_duplicate(phone_norm: str) -> bool:
 
     resp2 = bitrix_post("crm.duplicate.findByComm", {
         "type":        "PHONE",
-        "values":      [phone_digits],
+        "values":      values,
         "entity_type": "LEAD",
     })
     if 'result' not in resp2 or 'error' in resp2:
@@ -351,9 +357,9 @@ def find_lead_by_request_uid(request_uid: str) -> int | None:
 
 
 def find_contact_by_phone(phone_norm: str) -> int | None:
-    digits = re.sub(r'\D', '', phone_norm)
     result = bitrix_post('crm.duplicate.findByComm', {
-        'type': 'PHONE', 'values': [digits], 'entity_type': 'CONTACT',
+        'type': 'PHONE', 'values': duplicate_phone_values(phone_norm),
+        'entity_type': 'CONTACT',
     })
     if 'error' in result or 'result' not in result:
         raise RuntimeError('Не удалось проверить контакт по телефону')
@@ -514,7 +520,27 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         if find_lead_by_request_uid(request_uid):
             return None, "duplicate", category
 
+        # A new Telegram message is not necessarily a new customer. Reject a
+        # phone already present in ANY Bitrix contact or lead, across all
+        # partners, before creating CRM entities.
+        #
+        # Persist the successful precheck before writing a contact. Otherwise,
+        # a failed lead.add would leave our newly created contact in Bitrix and
+        # the retry would incorrectly discard the still-undelivered request.
+        journal = get_delivery_queue()
+        previously_prechecked = journal.phone_prechecked(request_uid)
+        if not previously_prechecked:
+            if check_duplicate(phone_norm):
+                return None, "duplicate", category
+            journal.mark_phone_prechecked(request_uid)
+
         contact_id = find_contact_by_phone(phone_norm)
+        if contact_id and not previously_prechecked:
+            # Another CRM writer might have created this contact between the
+            # initial duplicate search and the second lookup. Only reuse a
+            # contact on retries of this *same* previously-authorized event.
+            journal.clear_phone_precheck(request_uid)
+            return None, "duplicate", category
         title = f"Ремонт | {phone_norm} | {name}"
 
         # Keep the original Telegram message intact. The request UID is stored
@@ -572,6 +598,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             print(f"🔎 Комментарий лида подтверждён: {bool(saved)}")
 
         if lead_id:
+            mark_phone_known(phone_norm)
             return lead_id, "ok", category
 
         return None, "bitrix_error", category

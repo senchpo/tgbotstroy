@@ -34,9 +34,39 @@ class DeliveryQueue:
                 decided_by INTEGER,
                 UNIQUE(chat_id, message_id)
             )''')
+            # A CRM contact may be created before the matching lead. Remember
+            # that this Telegram request passed phone deduplication *before*
+            # writing either object, so retries can finish a partial delivery
+            # without mistaking our own new contact for a pre-existing client.
+            db.execute('''CREATE TABLE IF NOT EXISTS phone_prechecks (
+                request_uid TEXT PRIMARY KEY,
+                checked_at REAL NOT NULL
+            )''')
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=15)
+
+    def phone_prechecked(self, request_uid: str) -> bool:
+        if not request_uid:
+            return False
+        with self._connect() as db:
+            return db.execute('''SELECT 1 FROM phone_prechecks
+                WHERE request_uid=?''', (request_uid,)).fetchone() is not None
+
+    def mark_phone_prechecked(self, request_uid: str):
+        if not request_uid:
+            return
+        with self._connect() as db:
+            db.execute('''INSERT OR IGNORE INTO phone_prechecks
+                (request_uid, checked_at) VALUES (?, ?)''',
+                (request_uid, time.time()))
+
+    def clear_phone_precheck(self, request_uid: str):
+        if not request_uid:
+            return
+        with self._connect() as db:
+            db.execute('DELETE FROM phone_prechecks WHERE request_uid=?',
+                       (request_uid,))
 
     def enqueue(self, chat_id: int, message_id: int, chat_title: str, body: str):
         with self._connect() as db:

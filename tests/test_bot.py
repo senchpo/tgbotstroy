@@ -90,6 +90,23 @@ class ParsingTests(unittest.TestCase):
                 self.assertEqual(send.call_args.args[0]['raw_text'], raw)
                 self.assertEqual(bot._delivery_queue.ready(), [])
 
+    def test_group_request_with_existing_crm_contact_is_rejected_and_acked(self):
+        message = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-112, title='Трафик Любовь'),
+            message_id=330, text='Иван. КП Дубрава. Обои, с/у 89663887744',
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'bitrix_post', return_value={
+                 'result': {'CONTACT': [7654]}
+             }) as post, patch.object(bot, 'set_reaction') as reaction, \
+             patch.object(bot.time, 'sleep'):
+            bot.handle_message(message)
+        self.assertEqual(bot._delivery_queue.ready(), [])
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], 'crm.duplicate.findByComm')
+        reaction.assert_called_once_with(-112, 330, '❌')
+
     def test_ambiguous_request_is_reviewed_and_not_auto_sent(self):
         message = types.SimpleNamespace(
             chat=types.SimpleNamespace(id=-1000, title='Заявки Виктор'),
@@ -267,6 +284,7 @@ class ParsingTests(unittest.TestCase):
 
     def test_failed_lead_does_not_enter_duplicate_cache(self):
         with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'check_duplicate', return_value=False), \
              patch.object(bot, 'find_contact_by_phone', return_value=None), \
              patch.object(bot, 'bitrix_post', side_effect=[{'result': 42}, {'error': 'failed'}]), \
              patch.object(bot.time, 'sleep'):
@@ -287,25 +305,91 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(status, 'duplicate')
         post.assert_not_called()
 
-    def test_existing_contact_can_have_new_request(self):
+    def test_existing_contact_blocks_new_request_even_from_other_partner(self):
         with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
-             patch.object(bot, 'find_contact_by_phone', return_value=42), \
+             patch.object(bot, 'find_contact_by_phone') as find_contact, \
+             patch.object(bot, 'bitrix_post', return_value={
+                 'result': {'CONTACT': [42]}
+             }) as post, patch.object(bot.time, 'sleep'):
+            lead_id, status, _ = bot.send_to_bitrix({
+                'phone': '89663887744', 'request_uid': 'tg_new_partner',
+                'name': 'Иван', 'raw_text': 'Иван. Ремонт 89663887744',
+            }, 'UC_0RYYOV', 'Трафик Любовь', 'Трафик Любовь')
+        self.assertEqual((lead_id, status), (None, 'duplicate'))
+        find_contact.assert_not_called()
+        post.assert_called_once_with('crm.duplicate.findByComm', {
+            'type': 'PHONE',
+            'values': ['79663887744', '89663887744', '+79663887744'],
+            'entity_type': 'CONTACT',
+        })
+        self.assertFalse(bot._delivery_queue.phone_prechecked('tg_new_partner'))
+
+    def test_existing_lead_without_contact_still_blocks_request(self):
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'find_contact_by_phone') as find_contact, \
              patch.object(bot, 'bitrix_post', side_effect=[
-                 {'result': 321}, {'result': {'COMMENTS': 'yes'}}
+                 {'result': []}, {'result': {'LEAD': [8765]}}
              ]) as post, patch.object(bot.time, 'sleep'):
             lead_id, status, _ = bot.send_to_bitrix({
-                'phone': '89775179200', 'request_uid': 'tg_unique',
-            }, 'OTHER', 'Telegram', 'Общая группа')
-        self.assertEqual((lead_id, status), (321, 'ok'))
-        self.assertEqual(post.call_args_list[0].args[0], 'crm.lead.add')
-        fields = post.call_args_list[0].args[1]['fields']
-        self.assertEqual(fields['CONTACT_ID'], 42)
-        self.assertEqual(fields['UF_CRM_1776153852'], 'tg_unique')
-        self.assertNotIn('TYPE_ID', fields)
+                'phone': '+7 966 388-77-44', 'request_uid': 'tg_different',
+            }, 'OTHER', 'Telegram', 'Другой партнёр')
+        self.assertEqual((lead_id, status), (None, 'duplicate'))
+        self.assertEqual([c.args[0] for c in post.call_args_list],
+                         ['crm.duplicate.findByComm', 'crm.duplicate.findByComm'])
+        find_contact.assert_not_called()
+
+    def test_duplicate_lookup_failure_never_writes_to_crm(self):
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'find_contact_by_phone') as find_contact, \
+             patch.object(bot, 'bitrix_post', return_value={}) as post, \
+             patch.object(bot.time, 'sleep'):
+            lead_id, status, _ = bot.send_to_bitrix({
+                'phone': '89663887744', 'request_uid': 'tg_retry_later',
+            }, 'OTHER', 'Telegram', 'Партнёр')
+        self.assertEqual((lead_id, status), (None, 'bitrix_error'))
+        self.assertEqual(post.call_count, 1)
+        find_contact.assert_not_called()
+        self.assertFalse(bot._delivery_queue.phone_prechecked('tg_retry_later'))
+
+    def test_contact_appearing_after_precheck_is_not_reused_on_first_attempt(self):
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'check_duplicate', return_value=False), \
+             patch.object(bot, 'find_contact_by_phone', return_value=4321), \
+             patch.object(bot, 'bitrix_post') as post, \
+             patch.object(bot.time, 'sleep'):
+            lead_id, status, _ = bot.send_to_bitrix({
+                'phone': '89663887744', 'request_uid': 'tg_concurrent_contact',
+            }, 'OTHER', 'Telegram', 'Партнёр')
+        self.assertEqual((lead_id, status), (None, 'duplicate'))
+        post.assert_not_called()
+        self.assertFalse(bot._delivery_queue.phone_prechecked('tg_concurrent_contact'))
+
+    def test_precheck_survives_restart_after_contact_created_but_lead_failed(self):
+        with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'check_duplicate', return_value=False) as precheck, \
+             patch.object(bot, 'find_contact_by_phone', side_effect=[None, 4321]), \
+             patch.object(bot, 'bitrix_post', side_effect=[
+                 {'result': 4321}, {'error': 'lead temporarily unavailable'},
+                 {'result': 8765}, {'result': {'COMMENTS': 'test'}},
+             ]) as post, patch.object(bot.time, 'sleep'):
+            lead = {'phone': '89663887744', 'name': 'Иван',
+                    'request_uid': 'tg_partial_delivery'}
+            first = bot.send_to_bitrix(lead, 'OTHER', 'Telegram', 'Партнёр')
+            self.assertEqual(first[:2], (None, 'bitrix_error'))
+            self.assertTrue(bot._delivery_queue.phone_prechecked('tg_partial_delivery'))
+            bot._delivery_queue = DeliveryQueue(bot._delivery_queue.path)
+            second = bot.send_to_bitrix(lead, 'OTHER', 'Telegram', 'Партнёр')
+        self.assertEqual(second[:2], (8765, 'ok'))
+        precheck.assert_called_once_with('+79663887744')
+        self.assertEqual([c.args[0] for c in post.call_args_list],
+                         ['crm.contact.add', 'crm.lead.add',
+                          'crm.lead.add', 'crm.lead.get'])
+        self.assertTrue(bot.is_phone_known('+79663887744'))
 
     def test_lead_title_and_comment_preserve_original_telegram_message(self):
         original = '89775179200 Борис. М Крылатское с/у плиточные работы. Оп Любовь'
         with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
+             patch.object(bot, 'check_duplicate', return_value=False), \
              patch.object(bot, 'find_contact_by_phone', return_value=None), \
              patch.object(bot, 'bitrix_post', side_effect=[
                  {'result': 4440}, {'result': 5610},
@@ -326,16 +410,18 @@ class ParsingTests(unittest.TestCase):
 
     def test_phone_only_title_and_comment_without_missing_fields(self):
         with patch.object(bot, 'find_lead_by_request_uid', return_value=None), \
-             patch.object(bot, 'find_contact_by_phone', return_value=42), \
+             patch.object(bot, 'check_duplicate', return_value=False), \
+             patch.object(bot, 'find_contact_by_phone', return_value=None), \
              patch.object(bot, 'bitrix_post', side_effect=[
-                 {'result': 321}, {'result': {'COMMENTS': '89775179200'}}
+                 {'result': 42}, {'result': 321},
+                 {'result': {'COMMENTS': '89775179200'}}
              ]) as post, patch.object(bot.time, 'sleep'):
             lead_id, status, _ = bot.send_to_bitrix({
                 'phone': '89775179200', 'name': 'Не указано',
                 'raw_text': '89775179200',
             }, 'OTHER', 'Telegram', 'Личные')
         self.assertEqual((lead_id, status), (321, 'ok'))
-        fields = post.call_args_list[0].args[1]['fields']
+        fields = post.call_args_list[1].args[1]['fields']
         self.assertEqual(fields['TITLE'], 'Ремонт | +79775179200 | Не указано')
         self.assertEqual(fields['COMMENTS'], '89775179200')
 

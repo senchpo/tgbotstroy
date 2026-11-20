@@ -121,8 +121,20 @@ separately before relying on new functionality.
 The field labelled `UF_CRM_REQUEST_UID` was confirmed by a **read-only** REST
 audit of the production portal on 2026-11-18 as `UF_CRM_1776153852` (string).
 The bot now writes a deterministic Telegram request UID to this field and
-checks `crm.lead.list` before creating a lead. Existing contacts can therefore
-receive new leads without being blocked by phone-only deduplication.
+checks `crm.lead.list` before creating a lead. **A different Telegram message
+is not a new customer:** before creating a contact or lead, the bot also calls
+`crm.duplicate.findByComm` for both CONTACT and LEAD using the normalized phone.
+If either exists in Bitrix24 (regardless of the partner, name, lead stage or
+work description), the new Telegram request is discarded as a duplicate. This
+is deliberately strict: partners reusing temporary phone numbers will have
+legitimate new requests rejected until the policy is changed.
+
+After an event passes its initial phone check, a `phone_prechecks` SQLite
+journal entry is committed **before** any CRM write. If contact creation works
+but lead creation fails, retrying the same Telegram event may reuse that
+contact without being blocked as a duplicate of itself. A separate Telegram
+event with the same phone is still rejected. If the duplicate search fails,
+no CRM write occurs and the pending event is retried.
 However, this lookup is not an atomic uniqueness constraint: simultaneous
 replicas, a network timeout during creation, or a crash between the lookup and
 write can still create duplicates. Exactly-once delivery is **not guaranteed**

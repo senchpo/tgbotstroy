@@ -39,6 +39,17 @@ class DeliveryQueueTests(unittest.TestCase):
         with patch('delivery_queue.time.time', return_value=1032):
             self.assertEqual(len(queue.ready()), 1)
 
+    def test_phone_precheck_is_durable_and_can_be_cancelled(self):
+        queue = DeliveryQueue(self.path)
+        self.assertFalse(queue.phone_prechecked('tg_case_1'))
+        queue.mark_phone_prechecked('tg_case_1')
+        queue.mark_phone_prechecked('tg_case_1')
+        reopened = DeliveryQueue(self.path)
+        self.assertTrue(reopened.phone_prechecked('tg_case_1'))
+        self.assertFalse(reopened.phone_prechecked('tg_case_2'))
+        reopened.clear_phone_precheck('tg_case_1')
+        self.assertFalse(DeliveryQueue(self.path).phone_prechecked('tg_case_1'))
+
     def test_stress_2000_events_reopen_and_replay(self):
         queue = DeliveryQueue(self.path)
         for i in range(2000):
