@@ -17,6 +17,11 @@ messages unless they clearly indicate a *new* request. This is a conservative
 rule, not a perfect intent detector. Ambiguous messages are logged without
 creating leads. Use explicit `новая заявка` on unusual requests.
 
+Refusal of an optional **business card** (`от визитки отказался`,
+`отказалась от визитки`) is not a refusal of repair work. These phrases do
+not block an otherwise valid phone-bearing request. Refusal of the **repair**
+itself (`от ремонта отказался`) remains a status message and creates no lead.
+
 Short example accepted:
 
 `89775179200 Борис. М Крылатское с/у плиточные работы. Оп Любовь`

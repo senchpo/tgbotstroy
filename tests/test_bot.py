@@ -248,6 +248,33 @@ class ParsingTests(unittest.TestCase):
     def test_valid_short_lead_passes_filter(self):
         self.assertTrue(bot.is_new_lead_message(self.SAMPLE))
 
+    def test_refusing_business_card_does_not_reject_repair_request(self):
+        self.assertTrue(bot.is_new_lead_message(
+            'Александр +7 (916) 123-45-67, косметический ремонт кухни, '
+            'завтра готов принять специалиста. От визитки отказался.'))
+
+    def test_realistic_card_refusal_reaches_crm_delivery(self):
+        raw = ('+7 (916) 123-45-67 Александр, квартира вторичка, '
+               'косметический ремонт кухни после затопления. '
+               'Завтра готов принять специалиста, Реутов, Примерная 6, '
+               'от визитки отказался. Оператор Александр.')
+        message = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-1009, title='Заявки Виктор'),
+            message_id=771, text=raw,
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'send_to_bitrix', return_value=(4321, 'ok', '')) as send, \
+             patch.object(bot, 'set_reaction') as reaction, \
+             patch.object(bot, 'send_review_notifications') as review:
+            bot.handle_message(message)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[0]['phone'], '+79161234567')
+        self.assertEqual(send.call_args.args[0]['name'], 'Александр')
+        self.assertEqual(send.call_args.args[0]['raw_text'], raw)
+        self.assertEqual(bot._delivery_queue.ready(), [])
+        reaction.assert_called_once_with(-1009, 771, '✅')
+        review.assert_not_called()
+
     def test_group_message_falls_back_when_ai_fails(self):
         message = types.SimpleNamespace(
             chat=types.SimpleNamespace(id=-123, title='Общая группа'),

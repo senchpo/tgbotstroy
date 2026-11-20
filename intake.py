@@ -25,6 +25,14 @@ STATUS_PHRASES = (
     'отложен', 'поставил', 'назначили дело',
 )
 
+# A customer declining the partner's business card is still a repair lead.
+# Remove only that incidental refusal before matching CRM status phrases;
+# another refusal (e.g. "от ремонта отказался") must still take precedence.
+VISIT_CARD_REFUSAL_RE = re.compile(
+    r'\b(?:от\s+визитк[а-яё]*\s+отказ[а-яё]*|'
+    r'отказ[а-яё]*\s+от\s+визитк[а-яё]*)\b'
+)
+
 NEW_REQUEST_PHRASES = (
     'новая заявка', 'новый клиент', 'новое обращение',
     'просит ремонт', 'нужен ремонт', 'нужно сделать', 'хочет ремонт',
@@ -77,7 +85,8 @@ def classify_message(text: str) -> Decision:
         return Decision('ignore', 'no_phone', ())
     value = text.casefold()
     request = any(x in value for x in REQUEST_WORDS)
-    status = any(x in value for x in STATUS_PHRASES)
+    status_text = VISIT_CARD_REFUSAL_RE.sub(' ', value)
+    status = any(x in status_text for x in STATUS_PHRASES)
     followup = 'перезвон' in value
     explicit_new = any(x in value for x in NEW_REQUEST_PHRASES)
     if explicit_new and request:

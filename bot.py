@@ -150,13 +150,8 @@ def extract_phones(text: str) -> list[str]:
 
 
 def is_new_lead_message(text: str) -> bool:
-    """Require a phone AND a work/request signal; reject obvious status posts."""
-    lowered = text.casefold()
-    if not extract_phones(text):
-        return False
-    if any(marker in lowered for marker in STATUS_MARKERS):
-        return False
-    return any(keyword in lowered for keyword in KEYWORDS)
+    """Compatibility helper; use the same rules as live Telegram intake."""
+    return classify_message(text).kind == 'new_request'
 
 
 def parse_lead_fallback(text: str) -> list[dict]:
