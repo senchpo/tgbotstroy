@@ -5,17 +5,20 @@ Bitrix24 contact and lead for new repair requests.
 
 ## Filtering
 
-A message is eligible only when **both** conditions hold:
-
-1. It contains a Russian phone number (starting with `8`, `7`, or `+7`).
-2. It contains a repair/service keyword or the word `заявка`.
+A message is eligible if it contains a Russian phone number and looks like a
+new request. Accepted examples include a number with repair details (even
+`косметика`, `31м`, `с/у`), a number with a name, just a phone number, or a
+partner's `Временный номер: +7 ...`.
 
 The `intake.py` classifier returns `new_request`, `status_update`, `ambiguous`,
-or `ignore` with a machine-readable reason. Known status phrases such as
+or `ignore` with a machine-readable reason and a 0–99 **heuristic confidence
+score**. This percentage is a ranking by rules, **not** a statistically
+measured probability. Known status phrases such as
 `перезвон`, `недозвон`, `выезд состоялся`, and `смета отправлена` exclude
 messages unless they clearly indicate a *new* request. This is a conservative
-rule, not a perfect intent detector. Ambiguous messages are logged without
-creating leads. Use explicit `новая заявка` on unusual requests.
+rule, not a perfect intent detector. Clear new requests go to CRM; plausible
+ambiguous requests with scores at least 60 and location/work hints go to
+admin review. Use explicit `новая заявка` on unusual requests.
 
 Refusal of an optional **business card** (`от визитки отказался`,
 `отказалась от визитки`) is not a refusal of repair work. These phrases do
@@ -46,6 +49,18 @@ CRM writes. Transient failures are retried with bounded exponential backoff
 (10 seconds to 1 hour); successful events are removed. On restart, the retry
 worker resumes pending events. Each Telegram event/phone has a deterministic
 UID, so a successful partial delivery will be recognized on replay.
+
+Polling now subscribes to **new messages, edited messages, and admin button
+callbacks**. If a partner edits an old message to include a phone or job
+details, the edited version is classified too. Captions of photos, documents,
+and videos are also inspected for lead details. The SQLite `intake_events`
+audit table retains every *observed* phone-bearing message's original text,
+classification reason, confidence, and delivery state (`created`, `duplicate`,
+`review`, `rejected`, `retry`, or `skipped`). This makes misses diagnosable but does not
+recover messages Telegram never delivered to the bot. Only the trusted
+`REVIEW_ADMIN_CHAT_ID` can use `/intake_stats` in a private chat for the last
+24 hours' outcomes and `/intake_last` for 10 recent event IDs and reasons.
+These diagnostic commands do not write to CRM.
 
 **Important:** configure `QUEUE_DB_PATH` on a **persistent Railway volume**,
 e.g. `/data/telegram_pending.sqlite3`. The default relative path is suitable
@@ -91,6 +106,11 @@ the same persistent `QUEUE_DB_PATH` volume as the delivery queue.
 Never set the review recipient to a shared group or an unverified Telegram ID.
 The review table may retain personal data until a decision is made; protect
 and back up the Railway volume accordingly.
+
+The `intake_events` audit retains raw text (including phone numbers) even for
+delivered and rejected messages. Back up and protect this volume and establish
+an appropriate retention/deletion policy for customer information; there is
+no automatic expiry in this version.
 
 The pending queue contains original Telegram messages, including names and
 phone numbers, **until delivery succeeds**. Protect the volume with Railway

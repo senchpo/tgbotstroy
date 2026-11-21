@@ -24,6 +24,7 @@ REVIEW_ADMIN_CHAT_ID = (int(_review_admin_setting)
                         if _review_admin_setting.isdigit()
                         else next(iter(ADMIN_USER_IDS)) if len(ADMIN_USER_IDS) == 1
                         else None)
+ALLOWED_UPDATES = ('message', 'edited_message', 'callback_query')
 
 # ============================================
 # БЛОКИРОВКИ ПО ТЕЛЕФОНУ
@@ -159,7 +160,7 @@ def parse_lead_fallback(text: str) -> list[dict]:
     phones = extract_phones(text)
     lowered = text.casefold()
     kind = ('Капитальный' if any(x in lowered for x in ('капитальн', 'под ключ'))
-            else 'Косметический' if 'косметическ' in lowered else None)
+            else 'Косметический' if any(x in lowered for x in ('косметическ', 'косметик')) else None)
     room = ('сан узла' if any(x in lowered for x in ('с/у', 'с.у.', 'сануз', 'сан уз', 'ванн', 'туалет'))
             else 'кухни' if 'кухн' in lowered else 'комнаты' if 'комнат' in lowered else None)
     category = f'Ремонт {room} {kind}' if room and kind else ''
@@ -634,6 +635,45 @@ def cmd_myid(msg):
         bot.reply_to(msg, f"Ваш Telegram ID: {msg.from_user.id}")
 
 
+@bot.message_handler(commands=['intake_stats'])
+def cmd_intake_stats(msg):
+    """Private, PII-free visibility into the previous day's intake outcomes."""
+    if (REVIEW_ADMIN_CHAT_ID is None
+            or getattr(msg.from_user, 'id', None) != REVIEW_ADMIN_CHAT_ID
+            or getattr(msg.chat, 'type', None) != 'private'):
+        return
+    with _queue_mutex:
+        counts = get_delivery_queue().intake_summary()
+    captions = {
+        'created': '✅ Созданы в CRM',
+        'duplicate': '⛔ Номер уже в CRM',
+        'review': '🤔 На проверке',
+        'rejected': '🚫 Отклонены после проверки',
+        'queued': '⌛ В очереди',
+        'retry': '🔄 Ожидают повторной отправки',
+        'skipped': '💬 Отфильтрованы как статусы/чат',
+    }
+    lines = ['📊 Обработка сообщений с телефоном за 24 часа:']
+    for state in ('created', 'duplicate', 'review', 'rejected', 'queued', 'retry', 'skipped'):
+        lines.append(f'{captions[state]}: {counts.get(state, 0)}')
+    bot.reply_to(msg, '\n'.join(lines))
+
+
+@bot.message_handler(commands=['intake_last'])
+def cmd_intake_last(msg):
+    """Review the last ten intake decisions without exposing phone numbers."""
+    if (REVIEW_ADMIN_CHAT_ID is None
+            or getattr(msg.from_user, 'id', None) != REVIEW_ADMIN_CHAT_ID
+            or getattr(msg.chat, 'type', None) != 'private'):
+        return
+    with _queue_mutex:
+        rows = get_delivery_queue().recent_intake()
+    lines = ['🧾 Последние решения бота:']
+    for title, mid, kind, reason, score, state in rows:
+        lines.append(f'{title} #{mid}: {score}% · {state} · {reason}')
+    bot.reply_to(msg, '\n'.join(lines[:11]))
+
+
 def send_review_notifications():
     """Notify one verified admin; failed Telegram DMs remain retryable."""
     if REVIEW_ADMIN_CHAT_ID is None:
@@ -649,7 +689,9 @@ def send_review_notifications():
                                            callback_data=f'rv:r:{review_id}'),
             )
             short_body = body if len(body) <= 3000 else body[:3000] + '\n…'
+            score = classify_message(body).confidence
             message = (f'🤔 Возможно, новая заявка (проверка №{review_id})\n'
+                       f'Оценка по правилам: {score}%\n'
                        f'Группа: {chat_title}\n\n{short_body}')
             try:
                 bot.send_message(REVIEW_ADMIN_CHAT_ID, message,
@@ -698,6 +740,7 @@ def handle_review_decision(call):
         except Exception:
             pass
         if not approve:
+            get_delivery_queue().set_intake_state(row[0], row[1], 'rejected')
             answer('Заявка отклонена')
             return
         answer('Подтверждено: отправляем в CRM')
@@ -751,9 +794,11 @@ def cmd_sources(msg):
     bot.reply_to(msg, text)
 
 
-@bot.message_handler(func=lambda m: True, content_types=['text'])
+@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'document', 'video'])
+@bot.edited_message_handler(func=lambda m: True, content_types=['text', 'photo', 'document', 'video'])
 def handle_message(message):
-    text = message.text or ""
+    text = (getattr(message, 'text', None)
+            or getattr(message, 'caption', None) or '')
     if not text or text.startswith('/') or len(text) < 10:
         return
     if getattr(message.from_user, 'is_bot', False):
@@ -761,9 +806,16 @@ def handle_message(message):
     # A valid phone is sufficient: contractors often abbreviate the service
     # (e.g. "с/у плиточные работы") or omit repair keywords altogether.
     decision = classify_message(text)
+    chat_title = getattr(message.chat, 'title', None) or 'Личные'
+    if decision.phones:
+        with _queue_mutex:
+            get_delivery_queue().record_intake(
+                message.chat.id, message.message_id, chat_title, text,
+                decision.kind, decision.reason, decision.confidence,
+                'queued' if decision.kind == 'new_request' else
+                'review' if needs_manual_review(text, decision) else 'skipped')
     if decision.kind != 'new_request':
         if needs_manual_review(text, decision):
-            chat_title = getattr(message.chat, 'title', None) or 'Личные'
             with _queue_mutex:
                 get_delivery_queue().add_review(message.chat.id,
                                                 message.message_id,
@@ -771,12 +823,13 @@ def handle_message(message):
                 send_review_notifications()
             return
         print(f'ℹ️ Пропущено сообщение: {decision.kind}/{decision.reason} '
+              f'оценка={decision.confidence}% '
               f'chat={message.chat.id} msg={message.message_id}')
         return
 
-    chat_title = getattr(message.chat, 'title', None) or 'Личные'
     # Journal before Bitrix writes: a failure must not silently consume the update.
     with _queue_mutex:
+        get_delivery_queue().supersede_review(message.chat.id, message.message_id)
         get_delivery_queue().enqueue(message.chat.id, message.message_id, chat_title, text)
         process_queued_message(message.chat.id, message.message_id, chat_title, text)
 
@@ -825,12 +878,15 @@ def process_queued_message(chat_id: int, message_id: int, chat_title: str,
 
     all_handled = bool(leads) and ok + dup == len(leads)
     if all_handled:
+        get_delivery_queue().set_intake_state(
+            chat_id, message_id, 'created' if ok else 'duplicate')
         get_delivery_queue().complete(chat_id, message_id)
         if ok:
             set_reaction(chat_id, message_id, "✅")
         elif dup:
             set_reaction(chat_id, message_id, "❌")
     else:
+        get_delivery_queue().set_intake_state(chat_id, message_id, 'retry')
         get_delivery_queue().defer(chat_id, message_id)
         print(f'⚠️ Заявка ожидает повтора: chat={chat_id} msg={message_id}')
     return all_handled
@@ -883,7 +939,7 @@ if __name__ == "__main__":
                 none_stop=True,
                 interval=2,
                 timeout=30,
-                allowed_updates=["message"]
+                allowed_updates=list(ALLOWED_UPDATES)
             )
         except Exception as e:
             print(f"❌ Polling: {e}")

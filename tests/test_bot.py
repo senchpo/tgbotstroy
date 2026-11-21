@@ -12,6 +12,7 @@ from delivery_queue import DeliveryQueue
 fake_telebot = types.ModuleType('telebot')
 fake_bot = MagicMock()
 fake_bot.message_handler.side_effect = lambda **kwargs: (lambda function: function)
+fake_bot.edited_message_handler.side_effect = lambda **kwargs: (lambda function: function)
 fake_bot.callback_query_handler.side_effect = lambda **kwargs: (lambda function: function)
 fake_telebot.TeleBot = MagicMock(return_value=fake_bot)
 sys.modules.setdefault('telebot', fake_telebot)
@@ -89,6 +90,103 @@ class ParsingTests(unittest.TestCase):
                 self.assertEqual(send.call_count, 1)
                 self.assertEqual(send.call_args.args[0]['raw_text'], raw)
                 self.assertEqual(bot._delivery_queue.ready(), [])
+
+    def test_three_victor_temporary_numbers_reach_crm_delivery(self):
+        messages = (
+            'Временный номер: +7 981 368-66-09\nДарья, 49м2, капитальный ремонт, будет жить в ремонте',
+            'Временный номер: +7 980 699-54-55\nИван, 31м, косметика',
+            'Временный номер: +7989 406-51-66\nЕлена, Путилково, косметика',
+        )
+        for index, body in enumerate(messages):
+            event = types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=-2000, title='Заявки Виктор'),
+                message_id=120 + index, text=body,
+                from_user=types.SimpleNamespace(is_bot=False),
+            )
+            with self.subTest(body=body), \
+                 patch.object(bot, 'send_to_bitrix', return_value=(100 + index, 'ok', '')) as send, \
+                 patch.object(bot, 'set_reaction'):
+                bot.handle_message(event)
+                self.assertEqual(send.call_count, 1)
+                self.assertEqual(send.call_args.args[0]['raw_text'], body)
+        self.assertEqual(bot._delivery_queue.intake_summary()['created'], 3)
+
+    def test_edited_message_can_become_a_lead(self):
+        event = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-2002, title='Заявки Виктор'),
+            message_id=200, text='Всем привет',
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'send_to_bitrix', return_value=(202, 'ok', '')) as send, \
+             patch.object(bot, 'set_reaction'):
+            bot.handle_message(event)
+            event.text = 'Временный номер: +7 980 699-54-55 Иван, 31м, косметика'
+            bot.handle_message(event)
+        send.assert_called_once()
+        self.assertEqual(bot._delivery_queue.intake_summary()['created'], 1)
+
+    def test_photo_caption_with_customer_phone_is_not_lost(self):
+        event = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-2004, title='Заявки Виктор'),
+            message_id=204, text=None,
+            caption='Временный номер +7989 406-51-66 Елена, косметика',
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'send_to_bitrix', return_value=(204, 'ok', '')) as send, \
+             patch.object(bot, 'set_reaction'):
+            bot.handle_message(event)
+        send.assert_called_once()
+        self.assertIn('Елена', send.call_args.args[0]['raw_text'])
+
+    def test_status_and_duplicate_are_audited_without_crm_delivery(self):
+        event = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-2003, title='Заявки Виктор'),
+            message_id=201, text='89161234567 недозвон',
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'send_to_bitrix', return_value=(None, 'duplicate', '')) as send, \
+             patch.object(bot, 'set_reaction'):
+            bot.handle_message(event)
+            send.assert_not_called()
+            self.assertEqual(bot._delivery_queue.intake_summary()['skipped'], 1)
+            event.message_id = 202
+            event.text = '89161234567 Иван косметика'
+            bot.handle_message(event)
+        self.assertEqual(bot._delivery_queue.intake_summary()['duplicate'], 1)
+
+    def test_intake_stats_only_for_authorized_private_admin(self):
+        event = types.SimpleNamespace(
+            from_user=types.SimpleNamespace(id=1126874839),
+            chat=types.SimpleNamespace(type='private'),
+        )
+        with patch.object(bot, 'REVIEW_ADMIN_CHAT_ID', 1126874839), \
+             patch.object(bot.bot, 'reply_to') as reply:
+            bot.cmd_intake_stats(event)
+            self.assertIn('Обработка сообщений', reply.call_args.args[1])
+            event.chat.type = 'group'
+            bot.cmd_intake_stats(event)
+            self.assertEqual(reply.call_count, 1)
+
+    def test_polling_subscribes_to_edits_and_review_button_events(self):
+        self.assertEqual(set(bot.ALLOWED_UPDATES),
+                         {'message', 'edited_message', 'callback_query'})
+
+    def test_edited_review_becoming_clear_request_invalidates_old_buttons(self):
+        event = types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=-2010, title='Заявки Виктор'),
+            message_id=300, text='Мария +7 916 123-45-67, Москва, нужен расчёт',
+            from_user=types.SimpleNamespace(is_bot=False),
+        )
+        with patch.object(bot, 'send_review_notifications'), \
+             patch.object(bot, 'send_to_bitrix', return_value=(300, 'ok', '')) as send, \
+             patch.object(bot, 'set_reaction'):
+            bot.handle_message(event)
+            review_id = bot._delivery_queue.reviews_to_notify()[0][0]
+            event.text = 'Мария +7 916 123-45-67, Москва, ремонт кухни'
+            bot.handle_message(event)
+        send.assert_called_once()
+        changed, _ = bot._delivery_queue.decide_review(review_id, True, 1126874839)
+        self.assertFalse(changed)
 
     def test_group_request_with_existing_crm_contact_is_rejected_and_acked(self):
         message = types.SimpleNamespace(

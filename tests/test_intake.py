@@ -34,6 +34,11 @@ class IntakeClassifierTests(unittest.TestCase):
          'специалиста по адресу: Реутов, Примерная 6 к 13:00, '
          'От визитки отказался. (Оператор Александр) Озвучено Оптима.'),
         'Мария +7 916 123-45-67 ремонт кухни, отказалась от визитки',
+        'Временный номер: +7 981 368-66-09 Дарья, 49м2, капитальный ремонт, будет жить в ремонте',
+        'Временный номер: +7 980 699-54-55 Иван, 31м, косметика',
+        'Временный номер: +7989 406-51-66 Елена, Путилково, косметика',
+        'Временный номер: +7989 406-51-66',
+        '+7 980 699-54-55 Иван, 31м',
     ]
     STATUS = [
         '89161234567 ремонт кухни, перезвонить',
@@ -50,6 +55,7 @@ class IntakeClassifierTests(unittest.TestCase):
         '89161234567 отложено по кухне',
         '89161234567 ремонт кухни, отказался от ремонта',
         '89161234567 ремонт кухни, от визитки отказался и от ремонта отказался',
+        'Временный номер: +7989 406-51-66 не берёт трубку',
     ]
     AMBIGUOUS = [
         '89161234567 привет',
@@ -78,6 +84,14 @@ class IntakeClassifierTests(unittest.TestCase):
     def test_phone_canonicalization_and_unique(self):
         self.assertEqual(phones_in('8 977 517 92 00, +7(977)517-92-00'),
                          ('+79775179200',))
+
+    def test_confidence_scale_and_sparse_updates(self):
+        candidate = classify_message('Временный номер: +7989 406-51-66 Елена, косметика')
+        self.assertGreaterEqual(candidate.confidence, 85)
+        self.assertLessEqual(candidate.confidence, 99)
+        self.assertEqual(classify_message('89161234567 недозвон').confidence, 5)
+        self.assertEqual(classify_message('Просто сообщение').confidence, 0)
+        self.assertLess(classify_message('89161234567 привет').confidence, 85)
 
     def test_event_uid_is_stable_but_distinct(self):
         a = event_uid(-100, 123, '+79775179200')

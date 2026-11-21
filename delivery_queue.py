@@ -42,6 +42,20 @@ class DeliveryQueue:
                 request_uid TEXT PRIMARY KEY,
                 checked_at REAL NOT NULL
             )''')
+            # Keep an explanation for every observed phone-bearing message,
+            # including excluded statuses and duplicate CRM phone numbers.
+            db.execute('''CREATE TABLE IF NOT EXISTS intake_events (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                chat_title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                confidence INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(chat_id, message_id)
+            )''')
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=15)
@@ -67,6 +81,47 @@ class DeliveryQueue:
         with self._connect() as db:
             db.execute('DELETE FROM phone_prechecks WHERE request_uid=?',
                        (request_uid,))
+
+    def record_intake(self, chat_id: int, message_id: int, chat_title: str,
+                      body: str, kind: str, reason: str,
+                      confidence: int, state: str):
+        with self._connect() as db:
+            db.execute('''INSERT INTO intake_events
+                (chat_id, message_id, chat_title, body, kind, reason,
+                 confidence, state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                    chat_title=excluded.chat_title, body=excluded.body,
+                    kind=excluded.kind, reason=excluded.reason,
+                    confidence=excluded.confidence, state=excluded.state,
+                    updated_at=excluded.updated_at''',
+                (chat_id, message_id, chat_title, body, kind, reason,
+                 confidence, state, time.time()))
+
+    def set_intake_state(self, chat_id: int, message_id: int, state: str):
+        with self._connect() as db:
+            db.execute('''UPDATE intake_events SET state=?, updated_at=?
+                WHERE chat_id=? AND message_id=?''',
+                (state, time.time(), chat_id, message_id))
+
+    def intake_summary(self, hours: int = 24):
+        with self._connect() as db:
+            return dict(db.execute('''SELECT state, COUNT(*) FROM intake_events
+                WHERE updated_at>=? GROUP BY state''',
+                (time.time() - hours * 3600,)).fetchall())
+
+    def recent_intake(self, limit: int = 10):
+        with self._connect() as db:
+            return db.execute('''SELECT chat_title, message_id, kind, reason,
+                confidence, state FROM intake_events
+                ORDER BY updated_at DESC LIMIT ?''', (limit,)).fetchall()
+
+    def supersede_review(self, chat_id: int, message_id: int):
+        """An edited message became a clear lead; invalidate old approval buttons."""
+        with self._connect() as db:
+            db.execute('''UPDATE manual_review SET state='superseded', body=''
+                WHERE chat_id=? AND message_id=? AND state='pending' ''',
+                (chat_id, message_id))
 
     def enqueue(self, chat_id: int, message_id: int, chat_title: str, body: str):
         with self._connect() as db:

@@ -50,6 +50,20 @@ class DeliveryQueueTests(unittest.TestCase):
         reopened.clear_phone_precheck('tg_case_1')
         self.assertFalse(DeliveryQueue(self.path).phone_prechecked('tg_case_1'))
 
+    def test_intake_audit_persists_and_tracks_reasons_for_non_delivery(self):
+        queue = DeliveryQueue(self.path)
+        queue.record_intake(-100, 1, 'Виктор', '89161234567 не дозвонился',
+                            'status_update', 'known_status_phrase', 5, 'skipped')
+        queue.record_intake(-100, 2, 'Виктор', '89161234568 Иван ремонт',
+                            'new_request', 'phone_and_work_intent', 97, 'queued')
+        queue.set_intake_state(-100, 2, 'duplicate')
+        reopened = DeliveryQueue(self.path)
+        self.assertEqual(reopened.intake_summary(), {'skipped': 1, 'duplicate': 1})
+        self.assertEqual(reopened.recent_intake()[0][5], 'duplicate')
+        reopened.record_intake(-100, 1, 'Виктор', '89161234567 Мария, ремонт',
+                               'new_request', 'phone_and_work_intent', 97, 'queued')
+        self.assertEqual(reopened.intake_summary(), {'queued': 1, 'duplicate': 1})
+
     def test_stress_2000_events_reopen_and_replay(self):
         queue = DeliveryQueue(self.path)
         for i in range(2000):
