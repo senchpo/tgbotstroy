@@ -5,7 +5,8 @@ import os
 import re
 import threading
 from datetime import datetime
-from intake import classify_message, event_uid
+from intake import classify_message, event_uid, needs_manual_review
+from delivery_queue import DeliveryQueue
 
 # ============================================
 # КОНФИГ
@@ -14,6 +15,16 @@ TOKEN        = os.environ.get("TOKEN", "")
 BITRIX_URL   = os.environ.get("BITRIX_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 USE_AI_PARSER = os.environ.get('USE_AI_PARSER', 'false').lower() == 'true'
+QUEUE_DB_PATH = os.environ.get('QUEUE_DB_PATH', 'telegram_pending.sqlite3')
+ADMIN_USER_IDS = {int(x) for x in os.environ.get('ADMIN_USER_IDS', '').split(',')
+                  if x.strip().isdigit()}
+_review_admin_setting = os.environ.get('REVIEW_ADMIN_CHAT_ID', '').strip()
+# Only a single, explicitly selected Telegram account receives customer PII.
+REVIEW_ADMIN_CHAT_ID = (int(_review_admin_setting)
+                        if _review_admin_setting.isdigit()
+                        else next(iter(ADMIN_USER_IDS)) if len(ADMIN_USER_IDS) == 1
+                        else None)
+ALLOWED_UPDATES = ('message', 'edited_message', 'callback_query')
 
 # ============================================
 # БЛОКИРОВКИ ПО ТЕЛЕФОНУ
@@ -140,13 +151,8 @@ def extract_phones(text: str) -> list[str]:
 
 
 def is_new_lead_message(text: str) -> bool:
-    """Require a phone AND a work/request signal; reject obvious status posts."""
-    lowered = text.casefold()
-    if not extract_phones(text):
-        return False
-    if any(marker in lowered for marker in STATUS_MARKERS):
-        return False
-    return any(keyword in lowered for keyword in KEYWORDS)
+    """Compatibility helper; use the same rules as live Telegram intake."""
+    return classify_message(text).kind == 'new_request'
 
 
 def parse_lead_fallback(text: str) -> list[dict]:
@@ -154,7 +160,7 @@ def parse_lead_fallback(text: str) -> list[dict]:
     phones = extract_phones(text)
     lowered = text.casefold()
     kind = ('Капитальный' if any(x in lowered for x in ('капитальн', 'под ключ'))
-            else 'Косметический' if 'косметическ' in lowered else None)
+            else 'Косметический' if any(x in lowered for x in ('косметическ', 'косметик')) else None)
     room = ('сан узла' if any(x in lowered for x in ('с/у', 'с.у.', 'сануз', 'сан уз', 'ванн', 'туалет'))
             else 'кухни' if 'кухн' in lowered else 'комнаты' if 'комнат' in lowered else None)
     category = f'Ремонт {room} {kind}' if room and kind else ''
@@ -165,7 +171,8 @@ def parse_lead_fallback(text: str) -> list[dict]:
         suffix = text[raw_match.end():].strip(' .,;:-') if raw_match else ''
         first_word = re.match(r'([А-ЯЁ][а-яё]+)\b', suffix)
         if not first_word and raw_match:
-            prefix = text[:raw_match.start()].splitlines()[-1].strip(' .,;:-')
+            prefix_lines = text[:raw_match.start()].splitlines()
+            prefix = prefix_lines[-1].strip(' .,;:-') if prefix_lines else ''
             first_word = re.search(r'([А-ЯЁ][а-яё]+)\s*$', prefix)
         name = first_word.group(1) if first_word else 'Не указано'
         metro = re.search(r'\b[мМ]\.?\s+([А-ЯЁа-яё][А-ЯЁа-яё-]+)', text)
@@ -186,8 +193,17 @@ def parse_lead_fallback(text: str) -> list[dict]:
         })
     return leads
 
-_processed_msgs: set[str] = set()
+_processed_msgs: set[str] = set()  # compatibility with older tests
 _processed_msgs_mutex = threading.Lock()
+_queue_mutex = threading.RLock()
+_delivery_queue = None
+
+
+def get_delivery_queue():
+    global _delivery_queue
+    if _delivery_queue is None:
+        _delivery_queue = DeliveryQueue(QUEUE_DB_PATH)
+    return _delivery_queue
 
 
 # ============================================
@@ -240,7 +256,7 @@ def get_type_id(category: str) -> str | None:
 
 
 def bitrix_post(method: str, payload: dict) -> dict:
-    url = BITRIX_URL + method
+    url = BITRIX_URL.rstrip('/') + '/' + method
     try:
         resp = requests.post(url, json=payload, timeout=15)
         data = resp.json()
@@ -267,17 +283,23 @@ def bitrix_post(method: str, payload: dict) -> dict:
 # ============================================
 # ПРОВЕРКА ДУБЛЕЙ
 # ============================================
-def check_duplicate(phone_norm: str) -> bool:
-    if is_phone_known(phone_norm):
-        print(f"⛔ [КЭШ] Дубль: {phone_norm}")
-        return True
+def duplicate_phone_values(phone_norm: str) -> list[str]:
+    """Look for both Russian 7/8 prefixes and formatted +7 CRM entries."""
+    digits = re.sub(r'\D', '', phone_norm)
+    if len(digits) == 11 and digits.startswith('7'):
+        return [digits, '8' + digits[1:], '+' + digits]
+    return [digits]
 
-    phone_digits = re.sub(r'\D', '', phone_norm)
+
+def check_duplicate(phone_norm: str) -> bool:
+    # The local cache is diagnostic only; CRM may change while the bot runs.
+    # Check Bitrix for every new Telegram event to avoid stale decisions.
+    values = duplicate_phone_values(phone_norm)
     print('🔍 Проверяем дубль по номеру')
 
     resp = bitrix_post("crm.duplicate.findByComm", {
         "type":        "PHONE",
-        "values":      [phone_digits],
+        "values":      values,
         "entity_type": "CONTACT",
     })
     if 'result' not in resp or 'error' in resp:
@@ -293,7 +315,7 @@ def check_duplicate(phone_norm: str) -> bool:
 
     resp2 = bitrix_post("crm.duplicate.findByComm", {
         "type":        "PHONE",
-        "values":      [phone_digits],
+        "values":      values,
         "entity_type": "LEAD",
     })
     if 'result' not in resp2 or 'error' in resp2:
@@ -331,9 +353,9 @@ def find_lead_by_request_uid(request_uid: str) -> int | None:
 
 
 def find_contact_by_phone(phone_norm: str) -> int | None:
-    digits = re.sub(r'\D', '', phone_norm)
     result = bitrix_post('crm.duplicate.findByComm', {
-        'type': 'PHONE', 'values': [digits], 'entity_type': 'CONTACT',
+        'type': 'PHONE', 'values': duplicate_phone_values(phone_norm),
+        'entity_type': 'CONTACT',
     })
     if 'error' in result or 'result' not in result:
         raise RuntimeError('Не удалось проверить контакт по телефону')
@@ -472,9 +494,6 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
     phone    = data.get('phone', '').strip()
     name     = data.get('name', 'Не указано').strip()
     address  = data.get('address', 'Не указано').strip()
-    volume   = data.get('work_volume', 'Не указано').strip()
-    deadline = data.get('deadline', 'Не указано').strip()
-    comment  = data.get('comment', 'Не указано').strip()
     category = data.get('category', '').strip()
     raw_text = data.get('raw_text', '')
     request_uid = data.get('request_uid', '')
@@ -497,22 +516,32 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         if find_lead_by_request_uid(request_uid):
             return None, "duplicate", category
 
-        contact_id = find_contact_by_phone(phone_norm)
-        title   = f"Ремонт | {name} | {address[:40]}"
+        # A new Telegram message is not necessarily a new customer. Reject a
+        # phone already present in ANY Bitrix contact or lead, across all
+        # partners, before creating CRM entities.
+        #
+        # Persist the successful precheck before writing a contact. Otherwise,
+        # a failed lead.add would leave our newly created contact in Bitrix and
+        # the retry would incorrectly discard the still-undelivered request.
+        journal = get_delivery_queue()
+        previously_prechecked = journal.phone_prechecked(request_uid)
+        if not previously_prechecked:
+            if check_duplicate(phone_norm):
+                return None, "duplicate", category
+            journal.mark_phone_prechecked(request_uid)
 
-        # ── КОММЕНТАРИЙ (без строк Источник и Чат) ───
-        comments = (
-            f"Имя: {name}\n"
-            f"Телефон: {phone_norm}\n"
-            f"Адрес: {address}\n"
-            f"Объём: {volume}\n"
-            f"Срок: {deadline}\n"
-            f"Тип: {category}\n"
-            f"Доп. инфо: {comment}\n"
-            f"Telegram request UID: {request_uid}\n"
-            f"---\n"
-            f"Оригинал:\n{raw_text}"
-        )
+        contact_id = find_contact_by_phone(phone_norm)
+        if contact_id and not previously_prechecked:
+            # Another CRM writer might have created this contact between the
+            # initial duplicate search and the second lookup. Only reuse a
+            # contact on retries of this *same* previously-authorized event.
+            journal.clear_phone_precheck(request_uid)
+            return None, "duplicate", category
+        title = f"Ремонт | {phone_norm} | {name}"
+
+        # Keep the original Telegram message intact. The request UID is stored
+        # separately in the CRM field, not mixed into customer-facing comments.
+        comments = raw_text if raw_text.strip() else f"{name}\n{phone_norm}"
 
         print('📝 Подготовлен комментарий к CRM без вывода персональных данных')
 
@@ -545,7 +574,8 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
         }
 
         # TYPE_ID is not available in this portal's crm.lead.fields.
-        # The repair category is preserved in COMMENTS, not an invalid field.
+        # TYPE_ID is unavailable in this portal; do not inject parsed metadata
+        # into COMMENTS, which must match the original Telegram message.
         if request_uid:
             lead_fields[REQUEST_UID_FIELD] = request_uid
 
@@ -564,6 +594,7 @@ def send_to_bitrix(data: dict, source_id: str, source_name: str, chat_title: str
             print(f"🔎 Комментарий лида подтверждён: {bool(saved)}")
 
         if lead_id:
+            mark_phone_known(phone_norm)
             return lead_id, "ok", category
 
         return None, "bitrix_error", category
@@ -598,8 +629,142 @@ def cmd_start(msg):
     bot.reply_to(msg, "✅ Бот активен.")
 
 
+@bot.message_handler(commands=['myid'])
+def cmd_myid(msg):
+    if getattr(msg.chat, 'type', None) == 'private':
+        bot.reply_to(msg, f"Ваш Telegram ID: {msg.from_user.id}")
+
+
+@bot.message_handler(commands=['intake_stats'])
+def cmd_intake_stats(msg):
+    """Private, PII-free visibility into the previous day's intake outcomes."""
+    if (REVIEW_ADMIN_CHAT_ID is None
+            or getattr(msg.from_user, 'id', None) != REVIEW_ADMIN_CHAT_ID
+            or getattr(msg.chat, 'type', None) != 'private'):
+        return
+    with _queue_mutex:
+        counts = get_delivery_queue().intake_summary()
+    captions = {
+        'created': '✅ Созданы в CRM',
+        'duplicate': '⛔ Номер уже в CRM',
+        'review': '🤔 На проверке',
+        'rejected': '🚫 Отклонены после проверки',
+        'queued': '⌛ В очереди',
+        'retry': '🔄 Ожидают повторной отправки',
+        'skipped': '💬 Отфильтрованы как статусы/чат',
+    }
+    lines = ['📊 Обработка сообщений с телефоном за 24 часа:']
+    for state in ('created', 'duplicate', 'review', 'rejected', 'queued', 'retry', 'skipped'):
+        lines.append(f'{captions[state]}: {counts.get(state, 0)}')
+    bot.reply_to(msg, '\n'.join(lines))
+
+
+@bot.message_handler(commands=['intake_last'])
+def cmd_intake_last(msg):
+    """Review the last ten intake decisions without exposing phone numbers."""
+    if (REVIEW_ADMIN_CHAT_ID is None
+            or getattr(msg.from_user, 'id', None) != REVIEW_ADMIN_CHAT_ID
+            or getattr(msg.chat, 'type', None) != 'private'):
+        return
+    with _queue_mutex:
+        rows = get_delivery_queue().recent_intake()
+    lines = ['🧾 Последние решения бота:']
+    for title, mid, kind, reason, score, state in rows:
+        lines.append(f'{title} #{mid}: {score}% · {state} · {reason}')
+    bot.reply_to(msg, '\n'.join(lines[:11]))
+
+
+def send_review_notifications():
+    """Notify one verified admin; failed Telegram DMs remain retryable."""
+    if REVIEW_ADMIN_CHAT_ID is None:
+        return
+    from telebot import types
+    with _queue_mutex:
+        for review_id, chat_title, body in get_delivery_queue().reviews_to_notify():
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.row(
+                types.InlineKeyboardButton('✅ Подтвердить',
+                                           callback_data=f'rv:a:{review_id}'),
+                types.InlineKeyboardButton('❌ Отклонить',
+                                           callback_data=f'rv:r:{review_id}'),
+            )
+            short_body = body if len(body) <= 3000 else body[:3000] + '\n…'
+            score = classify_message(body).confidence
+            message = (f'🤔 Возможно, новая заявка (проверка №{review_id})\n'
+                       f'Оценка по правилам: {score}%\n'
+                       f'Группа: {chat_title}\n\n{short_body}')
+            try:
+                bot.send_message(REVIEW_ADMIN_CHAT_ID, message,
+                                 reply_markup=keyboard)
+                get_delivery_queue().review_notified(review_id)
+                print(f'✅ Отправлена проверка заявки №{review_id}')
+            except Exception as exc:
+                get_delivery_queue().review_notify_failed(review_id)
+                print(f'⚠️ Не удалось отправить проверку №{review_id}: '
+                      f'{type(exc).__name__}')
+
+
+@bot.callback_query_handler(func=lambda call: bool(getattr(call, 'data', '')
+                                                   and call.data.startswith('rv:')))
+def handle_review_decision(call):
+    """Use only authenticated private callbacks; never trust callback payloads."""
+    def answer(message: str):
+        try:
+            bot.answer_callback_query(call.id, message)
+        except Exception:
+            pass
+
+    if (REVIEW_ADMIN_CHAT_ID is None
+            or getattr(call.from_user, 'id', None) != REVIEW_ADMIN_CHAT_ID
+            or getattr(getattr(call.message, 'chat', None), 'id', None)
+            != REVIEW_ADMIN_CHAT_ID):
+        answer('Нет доступа')
+        return
+    parts = (call.data or '').split(':')
+    if len(parts) != 3 or parts[0] != 'rv' or parts[1] not in ('a', 'r') \
+            or not parts[2].isdigit():
+        answer('Некорректная команда')
+        return
+
+    approve = parts[1] == 'a'
+    with _queue_mutex:
+        changed, row = get_delivery_queue().decide_review(
+            int(parts[2]), approve, REVIEW_ADMIN_CHAT_ID)
+        if not changed:
+            answer('Решение уже принято или заявка не найдена')
+            return
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id,
+                                          call.message.message_id,
+                                          reply_markup=None)
+        except Exception:
+            pass
+        if not approve:
+            get_delivery_queue().set_intake_state(row[0], row[1], 'rejected')
+            answer('Заявка отклонена')
+            return
+        answer('Подтверждено: отправляем в CRM')
+        chat_id, message_id, chat_title, body, _ = row
+        try:
+            success = process_queued_message(chat_id, message_id,
+                                             chat_title, body)
+        except Exception as exc:
+            print(f'⚠️ Ошибка отправки подтверждённой заявки: '
+                  f'{type(exc).__name__}')
+            success = False
+        try:
+            bot.send_message(REVIEW_ADMIN_CHAT_ID,
+                             ('✅ Подтверждённая заявка обработана в CRM.' if success
+                              else '⚠️ Заявка сохранена в очереди CRM и будет '
+                                   'отправлена повторно автоматически.'))
+        except Exception:
+            pass
+
+
 @bot.message_handler(commands=['test'])
 def cmd_test(msg):
+    if not ADMIN_USER_IDS or getattr(msg.from_user, 'id', None) not in ADMIN_USER_IDS:
+        return
     r = bitrix_post("crm.lead.list", {"filter": {"ID": "1"}, "select": ["ID"]})
     if isinstance(r, dict) and 'result' in r:
         bot.reply_to(msg, "✅ Битрикс доступен!")
@@ -609,6 +774,8 @@ def cmd_test(msg):
 
 @bot.message_handler(commands=['cache'])
 def cmd_cache(msg):
+    if not ADMIN_USER_IDS or getattr(msg.from_user, 'id', None) not in ADMIN_USER_IDS:
+        return
     with _known_phones_mutex:
         phones = sorted(_known_phones)
     text = f"📋 Кэш ({len(phones)}):\n" + "\n".join(phones[-20:]) if phones else "📋 Кэш пуст"
@@ -617,6 +784,8 @@ def cmd_cache(msg):
 
 @bot.message_handler(commands=['sources'])
 def cmd_sources(msg):
+    if not ADMIN_USER_IDS or getattr(msg.from_user, 'id', None) not in ADMIN_USER_IDS:
+        return
     r = bitrix_post("crm.status.list", {"filter": {"ENTITY_ID": "SOURCE"}})
     items = r.get("result", [])
     text  = "📋 Источники в Битрикс:\n\n"
@@ -625,18 +794,11 @@ def cmd_sources(msg):
     bot.reply_to(msg, text)
 
 
-@bot.message_handler(func=lambda m: True, content_types=['text'])
+@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'document', 'video'])
+@bot.edited_message_handler(func=lambda m: True, content_types=['text', 'photo', 'document', 'video'])
 def handle_message(message):
-    msg_key = f"{message.chat.id}_{message.message_id}"
-    with _processed_msgs_mutex:
-        if msg_key in _processed_msgs:
-            print(f"⚠️ Уже обработано: {msg_key}")
-            return
-        _processed_msgs.add(msg_key)
-        if len(_processed_msgs) > 2000:
-            _processed_msgs.clear()
-
-    text = message.text or ""
+    text = (getattr(message, 'text', None)
+            or getattr(message, 'caption', None) or '')
     if not text or text.startswith('/') or len(text) < 10:
         return
     if getattr(message.from_user, 'is_bot', False):
@@ -644,17 +806,47 @@ def handle_message(message):
     # A valid phone is sufficient: contractors often abbreviate the service
     # (e.g. "с/у плиточные работы") or omit repair keywords altogether.
     decision = classify_message(text)
+    chat_title = getattr(message.chat, 'title', None) or 'Личные'
+    if decision.phones:
+        with _queue_mutex:
+            get_delivery_queue().record_intake(
+                message.chat.id, message.message_id, chat_title, text,
+                decision.kind, decision.reason, decision.confidence,
+                'queued' if decision.kind == 'new_request' else
+                'review' if needs_manual_review(text, decision) else 'skipped')
     if decision.kind != 'new_request':
+        if needs_manual_review(text, decision):
+            with _queue_mutex:
+                get_delivery_queue().add_review(message.chat.id,
+                                                message.message_id,
+                                                chat_title, text)
+                send_review_notifications()
+            return
         print(f'ℹ️ Пропущено сообщение: {decision.kind}/{decision.reason} '
+              f'оценка={decision.confidence}% '
               f'chat={message.chat.id} msg={message.message_id}')
         return
 
-    chat_title             = getattr(message.chat, 'title', None) or "Личные"
+    # Journal before Bitrix writes: a failure must not silently consume the update.
+    with _queue_mutex:
+        get_delivery_queue().supersede_review(message.chat.id, message.message_id)
+        get_delivery_queue().enqueue(message.chat.id, message.message_id, chat_title, text)
+        process_queued_message(message.chat.id, message.message_id, chat_title, text)
+
+
+def process_queued_message(chat_id: int, message_id: int, chat_title: str,
+                           text: str) -> bool:
+    """Return True only after every phone in the Telegram event is handled."""
+    if (classify_message(text).kind != 'new_request'
+            and not get_delivery_queue().is_review_approved(chat_id, message_id)):
+        get_delivery_queue().complete(chat_id, message_id)
+        return True
+
     source_id, source_name = get_source_from_message(chat_title, text)
 
     print(f"\n{'='*50}")
     print(f"📨 Чат: '{chat_title}' | Источник: {source_name} [{source_id}]")
-    print(f'📝 Новая заявка: chat={message.chat.id} msg={message.message_id}')
+    print(f'📝 Новая заявка: chat={chat_id} msg={message_id}')
 
     leads = parse_lead_ai(text) if USE_AI_PARSER and GROQ_API_KEY else []
     actual_phones = set(extract_phones(text))
@@ -667,11 +859,10 @@ def handle_message(message):
     ok = dup = skip = 0
 
     for lead in leads:
-        lead['request_uid'] = event_uid(message.chat.id, message.message_id,
+        lead['request_uid'] = event_uid(chat_id, message_id,
                                         normalize_phone(lead.get('phone', '')))
         lid, status, cat = send_to_bitrix(lead, source_id, source_name, chat_title)
         n = lead.get('name', '—')
-        p = lead.get('phone', '—')
 
         if status == "ok":
             ok += 1
@@ -683,16 +874,44 @@ def handle_message(message):
             skip += 1
             print(f"⚠️ Нет телефона: {n}")
         else:
-            print(f"❌ Ошибка: {n} | {p}")
+            print('❌ Не удалось доставить заявку в CRM')
 
-    if ok:
-        set_reaction(message.chat.id, message.message_id, "✅")
-    elif dup:
-        set_reaction(message.chat.id, message.message_id, "❌")
-    elif skip:
-        set_reaction(message.chat.id, message.message_id, "🤔")
+    all_handled = bool(leads) and ok + dup == len(leads)
+    if all_handled:
+        get_delivery_queue().set_intake_state(
+            chat_id, message_id, 'created' if ok else 'duplicate')
+        get_delivery_queue().complete(chat_id, message_id)
+        if ok:
+            set_reaction(chat_id, message_id, "✅")
+        elif dup:
+            set_reaction(chat_id, message_id, "❌")
     else:
-        print(f'❌ Заявка не создана: chat={message.chat.id} msg={message.message_id}')
+        get_delivery_queue().set_intake_state(chat_id, message_id, 'retry')
+        get_delivery_queue().defer(chat_id, message_id)
+        print(f'⚠️ Заявка ожидает повтора: chat={chat_id} msg={message_id}')
+    return all_handled
+
+
+def retry_pending():
+    """Try due events, including those journaled before the last restart."""
+    with _queue_mutex:
+        for chat_id, message_id, chat_title, text in get_delivery_queue().ready():
+            try:
+                process_queued_message(chat_id, message_id, chat_title, text)
+            except Exception as exc:
+                print(f'⚠️ Повтор заявки отложен: {type(exc).__name__}')
+                get_delivery_queue().defer(chat_id, message_id)
+
+
+def retry_loop():
+    while True:
+        try:
+            retry_pending()
+            send_review_notifications()
+        except Exception as exc:
+            # Do not permanently stop retries on an incidental SQLite/CRM error.
+            print(f'⚠️ Цикл повторов: {type(exc).__name__}')
+        time.sleep(20)
 
 
 # ============================================
@@ -700,6 +919,10 @@ def handle_message(message):
 # ============================================
 if __name__ == "__main__":
     print("✅ Бот стартует...")
+    if REVIEW_ADMIN_CHAT_ID is None:
+        print('⚠️ Ручная проверка: задайте REVIEW_ADMIN_CHAT_ID '
+              'или один ADMIN_USER_IDS; сомнительные заявки сохраняются.')
+    threading.Thread(target=retry_loop, daemon=True).start()
     try:
         # Preserve updates received while the service was offline.
         bot.delete_webhook(drop_pending_updates=False)
@@ -716,7 +939,7 @@ if __name__ == "__main__":
                 none_stop=True,
                 interval=2,
                 timeout=30,
-                allowed_updates=["message"]
+                allowed_updates=list(ALLOWED_UPDATES)
             )
         except Exception as e:
             print(f"❌ Polling: {e}")

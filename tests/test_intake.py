@@ -1,6 +1,6 @@
 import unittest
 
-from intake import classify_message, event_uid, phones_in
+from intake import classify_message, event_uid, phones_in, needs_manual_review
 
 
 class IntakeClassifierTests(unittest.TestCase):
@@ -20,6 +20,25 @@ class IntakeClassifierTests(unittest.TestCase):
         '89161234567 кухня 12 м2',
         '89161234567 ремонт балкона',
         '89161234567 штукатурка',
+        '+79539777262 стены/потолки/обои в 2к кв',
+        ('Валентина +7 980 558-73-66\nМытищи\nвтор косм 300-350кв по стенам\n'
+         'частичная подготовка стен под обои и поклейка обоев\n'
+         'просит скинуть смс с номером, куда можно будет перезвонить\n'
+         'и договориться о встрече со сметчиком'),
+        ('Анна 7 916 602-51-88\nКоньково\nвтор кап косм 48кв\n'
+         'сегодня будет советоваться с сестрой по поводу встречи с инженером\n'
+         'звонить завтра, во второй половине дня'),
+        ('+7 (916) 123-45-67 Александр, Квартира, Вторичка, Собственник, '
+         'Косметический ремонт, Москва (Реутов), Озвучена цена 150т.р. + '
+         'стройматериалы, Ремонт кухни после затопления, Завтра готов принять '
+         'специалиста по адресу: Реутов, Примерная 6 к 13:00, '
+         'От визитки отказался. (Оператор Александр) Озвучено Оптима.'),
+        'Мария +7 916 123-45-67 ремонт кухни, отказалась от визитки',
+        'Временный номер: +7 981 368-66-09 Дарья, 49м2, капитальный ремонт, будет жить в ремонте',
+        'Временный номер: +7 980 699-54-55 Иван, 31м, косметика',
+        'Временный номер: +7989 406-51-66 Елена, Путилково, косметика',
+        'Временный номер: +7989 406-51-66',
+        '+7 980 699-54-55 Иван, 31м',
     ]
     STATUS = [
         '89161234567 ремонт кухни, перезвонить',
@@ -34,6 +53,9 @@ class IntakeClassifierTests(unittest.TestCase):
         '89161234567 оплатил ремонт',
         '89161234567 ремонт закрыт',
         '89161234567 отложено по кухне',
+        '89161234567 ремонт кухни, отказался от ремонта',
+        '89161234567 ремонт кухни, от визитки отказался и от ремонта отказался',
+        'Временный номер: +7989 406-51-66 не берёт трубку',
     ]
     AMBIGUOUS = [
         '89161234567 привет',
@@ -63,11 +85,61 @@ class IntakeClassifierTests(unittest.TestCase):
         self.assertEqual(phones_in('8 977 517 92 00, +7(977)517-92-00'),
                          ('+79775179200',))
 
+    def test_confidence_scale_and_sparse_updates(self):
+        candidate = classify_message('Временный номер: +7989 406-51-66 Елена, косметика')
+        self.assertGreaterEqual(candidate.confidence, 85)
+        self.assertLessEqual(candidate.confidence, 99)
+        self.assertEqual(classify_message('89161234567 недозвон').confidence, 5)
+        self.assertEqual(classify_message('Просто сообщение').confidence, 0)
+        self.assertLess(classify_message('89161234567 привет').confidence, 85)
+
     def test_event_uid_is_stable_but_distinct(self):
         a = event_uid(-100, 123, '+79775179200')
         self.assertEqual(a, event_uid(-100, 123, '+79775179200'))
         self.assertNotEqual(a, event_uid(-100, 124, '+79775179200'))
         self.assertNotEqual(a, event_uid(-101, 123, '+79775179200'))
+
+    def test_minimal_requests_and_statuses(self):
+        for value in ('89775179200', '+7 (977) 517-92-00',
+                      '8 977 517 92 00.', '89775179200 Борис',
+                      'Борис 89775179200'):
+            with self.subTest(value=value):
+                self.assertEqual(classify_message(value).kind, 'new_request')
+        for value in ('89775179200 привет', '89775179200 новый номер',
+                      '89775179200 перезвонить', '89775179200 отказ'):
+            with self.subTest(value=value):
+                self.assertNotEqual(classify_message(value).kind, 'new_request')
+
+    def test_only_plausible_ambiguous_leads_are_escalated(self):
+        for message in (
+            'Мария +7 916 123-45-67, Москва, нужен расчёт',
+            'Анна 89161234567, м. Молодёжная, консультация',
+            '89161234567 установка ламината, сроки и стоимость',
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(classify_message(message).kind, 'ambiguous')
+                self.assertTrue(needs_manual_review(message))
+        for message in (
+            '89161234567 привет',
+            '89161234567 новый номер',
+            '89161234567 не берёт трубку',
+            '89161234567 ремонт кухни, перезвонить',
+            '89161234567',
+            'Всем привет без номера',
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(needs_manual_review(message))
+
+    def test_stress_10000_mixed_messages_without_exceptions(self):
+        for i in range(10000):
+            phone = f'89{i:09d}'
+            kind = i % 4
+            message = (phone if kind == 0 else
+                       phone + ' Иван' if kind == 1 else
+                       phone + ' ремонт кухни' if kind == 2 else
+                       phone + ' недозвон')
+            decision = classify_message(message)
+            self.assertEqual(decision.kind, 'status_update' if kind == 3 else 'new_request')
 
 
 if __name__ == '__main__':
